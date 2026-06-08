@@ -1,31 +1,46 @@
+import asyncio
 from dataclasses import dataclass
+from uuid import UUID, uuid4
 
 from integrations.models import Message
-from integrations.slack.slack_types import SlackViewInterface, StartingConvoException
-from integrations.utils import CONVERSATION_URL, get_final_agent_observation
+from integrations.resolver_context import ResolverUserContext
+from integrations.resolver_org_router import resolve_org_for_repo
+from integrations.slack.slack_errors import SlackError, SlackErrorCode
+from integrations.slack.slack_types import (
+    SlackMessageView,
+    SlackViewInterface,
+    StartingConvoException,
+)
+from integrations.slack.slack_v1_callback_processor import SlackV1CallbackProcessor
+from integrations.utils import (
+    CONVERSATION_URL,
+)
 from jinja2 import Environment
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 from storage.slack_conversation import SlackConversation
 from storage.slack_conversation_store import SlackConversationStore
 from storage.slack_team_store import SlackTeamStore
 from storage.slack_user import SlackUser
 
-from openhands.core.logger import openhands_logger as logger
-from openhands.core.schema.agent import AgentState
-from openhands.events.action import MessageAction
-from openhands.events.serialization.event import event_to_dict
-from openhands.integrations.provider import ProviderHandler
-from openhands.server.services.conversation_service import (
-    create_new_conversation,
-    setup_init_conversation_settings,
+from openhands.app_server.app_conversation.app_conversation_models import (
+    AppConversationStartRequest,
+    AppConversationStartTaskStatus,
+    ConversationTrigger,
+    SendMessageRequest,
 )
-from openhands.server.shared import ConversationStoreImpl, config, conversation_manager
-from openhands.server.user_auth.user_auth import UserAuth
-from openhands.storage.data_models.conversation_metadata import ConversationTrigger
-from openhands.utils.async_utils import GENERAL_TIMEOUT, call_async_from_sync
+from openhands.app_server.config import get_app_conversation_service
+from openhands.app_server.integrations.provider import ProviderHandler
+from openhands.app_server.sandbox.sandbox_models import SandboxStatus
+from openhands.app_server.services.injector import InjectorState
+from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
+from openhands.app_server.user_auth.user_auth import UserAuth
+from openhands.app_server.utils.async_utils import GENERAL_TIMEOUT
+from openhands.app_server.utils.logger import openhands_logger as logger
+from openhands.sdk import TextContent
 
 # =================================================
-# SECTION: Github view types
+# SECTION: Slack view types
 # =================================================
 
 
@@ -35,38 +50,9 @@ slack_team_store = SlackTeamStore.get_instance()
 
 
 @dataclass
-class SlackUnkownUserView(SlackViewInterface):
-    bot_access_token: str
-    user_msg: str | None
-    slack_user_id: str
-    slack_to_openhands_user: SlackUser | None
-    saas_user_auth: UserAuth | None
-    channel_id: str
-    message_ts: str
-    thread_ts: str | None
-    selected_repo: str | None
-    should_extract: bool
-    send_summary_instruction: bool
-    conversation_id: str
-    team_id: str
-
-    def _get_instructions(self, jinja_env: Environment) -> tuple[str, str]:
-        raise NotImplementedError
-
-    async def create_or_update_conversation(self, jinja_env: Environment):
-        raise NotImplementedError
-
-    def get_callback_id(self) -> str:
-        raise NotImplementedError
-
-    def get_response_msg(self) -> str:
-        raise NotImplementedError
-
-
-@dataclass
 class SlackNewConversationView(SlackViewInterface):
     bot_access_token: str
-    user_msg: str | None
+    user_msg: str
     slack_user_id: str
     slack_to_openhands_user: SlackUser
     saas_user_auth: UserAuth
@@ -95,32 +81,41 @@ class SlackNewConversationView(SlackViewInterface):
                 return block['user_id']
         return ''
 
-    def _get_instructions(self, jinja_env: Environment) -> tuple[str, str]:
-        "Instructions passed when conversation is first initialized"
-
+    async def _get_instructions(self, jinja_env: Environment) -> tuple[str, str]:
+        """Instructions passed when conversation is first initialized"""
         user_info: SlackUser = self.slack_to_openhands_user
 
         messages = []
         if self.thread_ts:
             client = WebClient(token=self.bot_access_token)
-            result = client.conversations_replies(
-                channel=self.channel_id,
-                ts=self.thread_ts,
-                inclusive=True,
-                latest=self.message_ts,
-                limit=CONTEXT_LIMIT,  # We can be smarter about getting more context/condensing it even in the future
-            )
+            try:
+                result = client.conversations_replies(
+                    channel=self.channel_id,
+                    ts=self.thread_ts,
+                    inclusive=True,
+                    latest=self.message_ts,
+                    limit=CONTEXT_LIMIT,  # We can be smarter about getting more context/condensing it even in the future
+                )
+            except SlackApiError as e:
+                if e.response.get('error') == 'missing_scope':
+                    raise SlackError(SlackErrorCode.MISSING_SLACK_SCOPES) from e
+                raise
 
             messages = result['messages']
 
         else:
             client = WebClient(token=self.bot_access_token)
-            result = client.conversations_history(
-                channel=self.channel_id,
-                inclusive=True,
-                latest=self.message_ts,
-                limit=CONTEXT_LIMIT,
-            )
+            try:
+                result = client.conversations_history(
+                    channel=self.channel_id,
+                    inclusive=True,
+                    latest=self.message_ts,
+                    limit=CONTEXT_LIMIT,
+                )
+            except SlackApiError as e:
+                if e.response.get('error') == 'missing_scope':
+                    raise SlackError(SlackErrorCode.MISSING_SLACK_SCOPES) from e
+                raise
 
             messages = result['messages']
             messages.reverse()
@@ -167,6 +162,7 @@ class SlackNewConversationView(SlackViewInterface):
                     'channel_id': self.channel_id,
                     'conversation_id': self.conversation_id,
                     'keycloak_user_id': user_info.keycloak_user_id,
+                    'org_id': user_info.org_id,
                     'parent_id': self.thread_ts or self.message_ts,
                 },
             )
@@ -174,50 +170,107 @@ class SlackNewConversationView(SlackViewInterface):
                 conversation_id=self.conversation_id,
                 channel_id=self.channel_id,
                 keycloak_user_id=user_info.keycloak_user_id,
+                org_id=user_info.org_id,
                 parent_id=self.thread_ts
                 or self.message_ts,  # conversations can start in a thread reply as well; we should always references the parent's (root level msg's) message ID
+                v1_enabled=True,  # All conversations are V1
             )
             await slack_conversation_store.create_slack_conversation(slack_conversation)
 
+    def _create_slack_v1_callback_processor(self) -> SlackV1CallbackProcessor:
+        """Create a SlackV1CallbackProcessor for V1 conversation handling."""
+        return SlackV1CallbackProcessor(
+            slack_view_data={
+                'channel_id': self.channel_id,
+                'message_ts': self.message_ts,
+                'thread_ts': self.thread_ts,
+                'team_id': self.team_id,
+                'slack_user_id': self.slack_user_id,
+            }
+        )
+
     async def create_or_update_conversation(self, jinja: Environment) -> str:
-        """
-        Only creates a new conversation
-        """
+        """Only creates a new conversation"""
         self._verify_necessary_values_are_set()
 
         provider_tokens = await self.saas_user_auth.get_provider_tokens()
-        user_secrets = await self.saas_user_auth.get_secrets()
-        user_instructions, conversation_instructions = self._get_instructions(jinja)
 
-        # Determine git provider from repository
-        git_provider = None
+        # Determine git provider from repository (needed for both org routing and conversation creation)
+        self._resolved_git_provider = None
         if self.selected_repo and provider_tokens:
             provider_handler = ProviderHandler(provider_tokens)
             repository = await provider_handler.verify_repo_provider(self.selected_repo)
-            git_provider = repository.git_provider
+            self._resolved_git_provider = repository.git_provider
 
-        agent_loop_info = await create_new_conversation(
-            user_id=self.slack_to_openhands_user.keycloak_user_id,
-            git_provider_tokens=provider_tokens,
-            selected_repository=self.selected_repo,
-            selected_branch=None,
-            initial_user_msg=user_instructions,
-            conversation_instructions=(
-                conversation_instructions if conversation_instructions else None
-            ),
-            image_urls=None,
-            replay_json=None,
-            conversation_trigger=ConversationTrigger.SLACK,
-            custom_secrets=user_secrets.custom_secrets if user_secrets else None,
-            git_provider=git_provider,
-        )
+        # Resolve target org based on claimed git organizations
+        self.resolved_org_id = None
+        if self._resolved_git_provider and self.selected_repo:
+            self.resolved_org_id = await resolve_org_for_repo(
+                provider=self._resolved_git_provider.value,
+                full_repo_name=self.selected_repo,
+                keycloak_user_id=self.slack_to_openhands_user.keycloak_user_id,
+            )
 
-        self.conversation_id = agent_loop_info.conversation_id
-        await self.save_slack_convo()
+        # V0 conversation path has been removed - all conversations use V1 app conversation service
+        await self._create_v1_conversation(jinja)
         return self.conversation_id
 
-    def get_callback_id(self) -> str:
-        return f'slack_{self.channel_id}_{self.message_ts}'
+    async def _create_v1_conversation(self, jinja: Environment) -> None:
+        """Create conversation using the new V1 app conversation system."""
+        user_instructions, conversation_instructions = await self._get_instructions(
+            jinja
+        )
+
+        # Create the initial message request
+        initial_message = SendMessageRequest(
+            role='user', content=[TextContent(text=user_instructions)]
+        )
+
+        # Create the Slack V1 callback processor
+        slack_callback_processor = self._create_slack_v1_callback_processor()
+
+        # Use git provider resolved in create_or_update_conversation
+        git_provider = self._resolved_git_provider
+
+        # Get the app conversation service and start the conversation
+        injector_state = InjectorState()
+
+        # Create the V1 conversation start request with the callback processor
+        self.conversation_id = uuid4().hex
+        start_request = AppConversationStartRequest(
+            conversation_id=UUID(self.conversation_id),
+            system_message_suffix=conversation_instructions,
+            initial_message=initial_message,
+            selected_repository=self.selected_repo,
+            git_provider=git_provider,
+            title=f'Slack conversation from {self.slack_to_openhands_user.slack_display_name}',
+            trigger=ConversationTrigger.SLACK,
+            processors=[
+                slack_callback_processor
+            ],  # Pass the callback processor directly
+        )
+
+        # Set up the Slack user context for the V1 system
+        slack_user_context = ResolverUserContext(
+            saas_user_auth=self.saas_user_auth,
+            resolver_org_id=self.resolved_org_id,
+        )
+        setattr(injector_state, USER_CONTEXT_ATTR, slack_user_context)
+
+        async with get_app_conversation_service(
+            injector_state
+        ) as app_conversation_service:
+            async for task in app_conversation_service.start_app_conversation(
+                start_request
+            ):
+                if task.status == AppConversationStartTaskStatus.ERROR:
+                    logger.error(f'Failed to start V1 conversation: {task.detail}')
+                    raise RuntimeError(
+                        f'Failed to start V1 conversation: {task.detail}'
+                    )
+
+        logger.info(f'[Slack V1]: Created new conversation: {self.conversation_id}')
+        await self.save_slack_convo()
 
     def get_response_msg(self) -> str:
         user_info: SlackUser = self.slack_to_openhands_user
@@ -237,15 +290,20 @@ class SlackNewConversationFromRepoFormView(SlackNewConversationView):
 class SlackUpdateExistingConversationView(SlackNewConversationView):
     slack_conversation: SlackConversation
 
-    def _get_instructions(self, jinja_env: Environment) -> tuple[str, str]:
+    async def _get_instructions(self, jinja_env: Environment) -> tuple[str, str]:
         client = WebClient(token=self.bot_access_token)
-        result = client.conversations_replies(
-            channel=self.channel_id,
-            ts=self.message_ts,
-            inclusive=True,
-            latest=self.message_ts,
-            limit=1,  # Get exact user message, in future we can be smarter with collecting additional context
-        )
+        try:
+            result = client.conversations_replies(
+                channel=self.channel_id,
+                ts=self.message_ts,
+                inclusive=True,
+                latest=self.message_ts,
+                limit=1,  # Get exact user message, in future we can be smarter with collecting additional context
+            )
+        except SlackApiError as e:
+            if e.response.get('error') == 'missing_scope':
+                raise SlackError(SlackErrorCode.MISSING_SLACK_SCOPES) from e
+            raise
 
         user_message = result['messages'][0]
         user_message = self._get_initial_prompt(
@@ -254,12 +312,103 @@ class SlackUpdateExistingConversationView(SlackNewConversationView):
 
         return user_message, ''
 
+    async def send_message_to_v1_conversation(self, jinja: Environment):
+        """Send a message to a v1 conversation using the agent server API."""
+        # Import services within the method to avoid circular imports
+        from openhands.agent_server.models import SendMessageRequest
+        from openhands.app_server.config import (
+            get_app_conversation_info_service,
+            get_httpx_client,
+            get_sandbox_service,
+        )
+        from openhands.app_server.event_callback.util import (
+            ensure_conversation_found,
+            get_agent_server_url_from_sandbox,
+        )
+        from openhands.app_server.services.injector import InjectorState
+        from openhands.app_server.user.specifiy_user_context import (
+            ADMIN,
+            USER_CONTEXT_ATTR,
+        )
+
+        # Create injector state for dependency injection
+        state = InjectorState()
+        setattr(state, USER_CONTEXT_ATTR, ADMIN)
+
+        async with (
+            get_app_conversation_info_service(state) as app_conversation_info_service,
+            get_sandbox_service(state) as sandbox_service,
+            get_httpx_client(state) as httpx_client,
+        ):
+            # 1. Conversation lookup
+            app_conversation_info = ensure_conversation_found(
+                await app_conversation_info_service.get_app_conversation_info(
+                    UUID(self.conversation_id)
+                ),
+                UUID(self.conversation_id),
+            )
+
+            # 2. Sandbox lookup + validation
+            sandbox = await sandbox_service.get_sandbox(
+                app_conversation_info.sandbox_id
+            )
+
+            if sandbox and sandbox.status == SandboxStatus.PAUSED:
+                # Resume paused sandbox and wait for it to be running
+                logger.info('[Slack V1]: Attempting to resume paused sandbox')
+                await sandbox_service.resume_sandbox(app_conversation_info.sandbox_id)
+
+            # Wait for sandbox to be running (handles both fresh start and resume)
+            running_sandbox = await sandbox_service.wait_for_sandbox_running(
+                app_conversation_info.sandbox_id,
+                timeout=120,
+                poll_interval=2,
+                httpx_client=httpx_client,
+            )
+
+            assert (
+                running_sandbox.session_api_key is not None
+            ), f'No session API key for sandbox: {running_sandbox.id}'
+
+            # 3. Get the agent server URL
+            agent_server_url = get_agent_server_url_from_sandbox(running_sandbox)
+
+            # 4. Prepare the message content
+            user_msg, _ = await self._get_instructions(jinja)
+
+            # 5. Create the message request
+            send_message_request = SendMessageRequest(
+                role='user', content=[TextContent(text=user_msg)], run=True
+            )
+
+            # 6. Send the message to the agent server
+            url = f'{agent_server_url.rstrip("/")}/api/conversations/{UUID(self.conversation_id)}/events'
+
+            headers = {'X-Session-API-Key': running_sandbox.session_api_key}
+            payload = send_message_request.model_dump()
+
+            try:
+                response = await httpx_client.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=30.0,
+                )
+                response.raise_for_status()
+
+            except Exception as e:
+                logger.error(
+                    '[Slack V1] Failed to send message to conversation %s: %s',
+                    self.conversation_id,
+                    str(e),
+                    exc_info=True,
+                )
+                raise Exception(f'Failed to send message to v1 conversation: {str(e)}')
+
     async def create_or_update_conversation(self, jinja: Environment) -> str:
-        """
-        Send new user message to converation
-        """
+        """Send new user message to conversation."""
         user_info: SlackUser = self.slack_to_openhands_user
-        saas_user_auth: UserAuth = self.saas_user_auth
+
         user_id = user_info.keycloak_user_id
 
         # Org management in the future will get rid of this
@@ -269,46 +418,8 @@ class SlackUpdateExistingConversationView(SlackNewConversationView):
                 f'{user_info.slack_display_name} is not authorized to send messages to this conversation.'
             )
 
-        # Check if conversation has been deleted
-        # Update logic when soft delete is implemented
-        conversation_store = await ConversationStoreImpl.get_instance(config, user_id)
-
-        try:
-            await conversation_store.get_metadata(self.conversation_id)
-        except FileNotFoundError:
-            raise StartingConvoException('Conversation no longer exists.')
-
-        provider_tokens = await saas_user_auth.get_provider_tokens()
-
-        # Should we raise here if there are no provider tokens?
-        providers_set = list(provider_tokens.keys()) if provider_tokens else []
-
-        conversation_init_data = await setup_init_conversation_settings(
-            user_id, self.conversation_id, providers_set
-        )
-
-        # Either join ongoing conversation, or restart the conversation
-        agent_loop_info = await conversation_manager.maybe_start_agent_loop(
-            self.conversation_id, conversation_init_data, user_id
-        )
-
-        final_agent_observation = get_final_agent_observation(
-            agent_loop_info.event_store
-        )
-        agent_state = (
-            None
-            if len(final_agent_observation) == 0
-            else final_agent_observation[0].agent_state
-        )
-
-        if not agent_state or agent_state == AgentState.LOADING:
-            raise StartingConvoException('Conversation is still starting')
-
-        user_msg, _ = self._get_instructions(jinja)
-        user_msg_action = MessageAction(content=user_msg)
-        await conversation_manager.send_event_to_conversation(
-            self.conversation_id, event_to_dict(user_msg_action)
-        )
+        # All conversations use V1 app conversation system
+        await self.send_message_to_v1_conversation(jinja)
 
         return self.conversation_id
 
@@ -337,11 +448,14 @@ class SlackFactory:
             return None
 
         # thread_ts in slack payloads in the parent's (root level msg's) message ID
+        if channel_id is None:
+            return None
         return await slack_conversation_store.get_slack_conversation(
             channel_id, thread_ts
         )
 
-    def create_slack_view_from_payload(
+    @staticmethod
+    async def create_slack_view_from_payload(
         message: Message, slack_user: SlackUser | None, saas_user_auth: UserAuth | None
     ):
         payload = message.message
@@ -352,7 +466,7 @@ class SlackFactory:
         team_id = payload['team_id']
         user_msg = payload.get('user_msg')
 
-        bot_access_token = slack_team_store.get_team_bot_token(team_id)
+        bot_access_token = await slack_team_store.get_team_bot_token(team_id)
         if not bot_access_token:
             logger.error(
                 'Did not find slack team',
@@ -361,30 +475,30 @@ class SlackFactory:
                     'channel_id': channel_id,
                 },
             )
-            raise Exception('Did not slack team')
+            raise Exception('Did not find slack team')
 
         # Determine if this is a known slack user by openhands
-        if not slack_user or not saas_user_auth or not channel_id:
-            return SlackUnkownUserView(
+        # Return SlackMessageView (not SlackViewInterface) for unauthenticated users
+        if not slack_user or not saas_user_auth or not channel_id or not message_ts:
+            return SlackMessageView(
                 bot_access_token=bot_access_token,
-                user_msg=user_msg,
                 slack_user_id=slack_user_id,
-                slack_to_openhands_user=slack_user,
-                saas_user_auth=saas_user_auth,
-                channel_id=channel_id,
-                message_ts=message_ts,
+                channel_id=channel_id or '',
+                message_ts=message_ts or '',
                 thread_ts=thread_ts,
-                selected_repo=None,
-                should_extract=False,
-                send_summary_instruction=False,
-                conversation_id='',
                 team_id=team_id,
             )
 
-        conversation: SlackConversation | None = call_async_from_sync(
-            SlackFactory.determine_if_updating_existing_conversation,
-            GENERAL_TIMEOUT,
-            message,
+        # At this point, we've verified slack_user, saas_user_auth, channel_id, and message_ts are set
+        # user_msg should always be present in Slack payloads
+        if not user_msg:
+            raise ValueError('user_msg is required but was not provided in payload')
+        assert channel_id is not None
+        assert message_ts is not None
+
+        conversation = await asyncio.wait_for(
+            SlackFactory.determine_if_updating_existing_conversation(message),
+            timeout=GENERAL_TIMEOUT,
         )
         if conversation:
             logger.info(
@@ -444,3 +558,11 @@ class SlackFactory:
                 conversation_id='',
                 team_id=team_id,
             )
+
+
+# Type alias for all authenticated Slack view types that can start conversations
+SlackViewType = (
+    SlackNewConversationView
+    | SlackNewConversationFromRepoFormView
+    | SlackUpdateExistingConversationView
+)

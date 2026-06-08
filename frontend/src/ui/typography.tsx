@@ -8,6 +8,7 @@ const typographyVariants = cva("", {
       h2: "text-xl font-semibold leading-6 -tracking-[0.02em] text-white",
       h3: "text-sm font-semibold text-gray-300",
       span: "text-sm font-normal text-white leading-5.5",
+      p: "text-sm font-normal text-white leading-5.5",
       codeBlock:
         "font-mono text-sm leading-relaxed text-gray-300 whitespace-pre-wrap",
     },
@@ -20,6 +21,7 @@ const typographyVariants = cva("", {
 interface TypographyProps extends VariantProps<typeof typographyVariants> {
   className?: string;
   testId?: string;
+  title?: string;
   children: React.ReactNode;
 }
 
@@ -27,6 +29,7 @@ export function Typography({
   variant,
   className,
   testId,
+  title,
   children,
 }: TypographyProps) {
   const Tag = variant as keyof React.JSX.IntrinsicElements;
@@ -34,6 +37,7 @@ export function Typography({
   return (
     <Tag
       data-testid={testId}
+      title={title}
       className={cn(typographyVariants({ variant }), className)}
     >
       {children}
@@ -81,10 +85,16 @@ export function H3({
 export function Text({
   className,
   testId,
+  title,
   children,
 }: Omit<TypographyProps, "variant">) {
   return (
-    <Typography variant="span" className={className} testId={testId}>
+    <Typography
+      variant="span"
+      className={className}
+      testId={testId}
+      title={title}
+    >
       {children}
     </Typography>
   );
@@ -102,9 +112,22 @@ export function CodeBlock({
   );
 }
 
+export function Paragraph({
+  className,
+  testId,
+  children,
+}: Omit<TypographyProps, "variant">) {
+  return (
+    <Typography variant="p" className={className} testId={testId}>
+      {children}
+    </Typography>
+  );
+}
+
 // Attach components to Typography for the expected API
 Typography.H1 = H1;
 Typography.H2 = H2;
 Typography.H3 = H3;
 Typography.Text = Text;
 Typography.CodeBlock = CodeBlock;
+Typography.Paragraph = Paragraph;

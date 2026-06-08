@@ -14,6 +14,8 @@ import { renderWithProviders } from "test-utils";
 import { formatTimeDelta } from "#/utils/format-time-delta";
 import { ConversationCard } from "#/components/features/conversation-panel/conversation-card/conversation-card";
 import { clickOnEditButton } from "./utils";
+import { ConversationCardActions } from "#/components/features/conversation-panel/conversation-card/conversation-card-actions";
+import { V1SandboxStatus } from "#/api/sandbox-service/sandbox-service.types";
 
 // We'll use the actual i18next implementation but override the translation function
 
@@ -431,4 +433,74 @@ describe("ConversationCard", () => {
 
     expect(screen.queryByTestId("ellipsis-button")).not.toBeInTheDocument();
   });
+
+  it("should render the llm model when provided", () => {
+    renderWithProviders(
+      <ConversationCard
+        onDelete={onDelete}
+        onChangeTitle={onChangeTitle}
+        title="Conversation 1"
+        selectedRepository={null}
+        lastUpdatedAt="2021-10-01T12:00:00Z"
+        llmModel="anthropic/claude-sonnet-4-20250514"
+      />,
+    );
+
+    const model = screen.getByTestId("conversation-card-llm-model");
+    expect(model).toBeInTheDocument();
+    expect(model).toHaveTextContent("anthropic/claude-sonnet-4-20250514");
+    expect(model).toHaveAttribute("title", "anthropic/claude-sonnet-4-20250514");
+    expect(model.querySelector("svg")).toBeInTheDocument();
+
+    // Verify truncation structure: text is wrapped in a span with truncate class
+    const textSpan = model.querySelector("span.truncate");
+    expect(textSpan).toBeInTheDocument();
+    expect(textSpan).toHaveTextContent("anthropic/claude-sonnet-4-20250514");
+  });
+
+  it("should not render the llm model when not provided", () => {
+    renderWithProviders(
+      <ConversationCard
+        onDelete={onDelete}
+        onChangeTitle={onChangeTitle}
+        title="Conversation 1"
+        selectedRepository={null}
+        lastUpdatedAt="2021-10-01T12:00:00Z"
+      />,
+    );
+
+    expect(
+      screen.queryByTestId("conversation-card-llm-model"),
+    ).not.toBeInTheDocument();
+  });
+
+  const statusTable: [V1SandboxStatus, boolean][] = [
+    ["RUNNING", true],
+    ["STARTING", true],
+    ["ERROR", false],
+    ["PAUSED", false],
+    ["MISSING", false],
+  ];
+
+  it.each(statusTable)(
+    "should toggle stop button visibility correctly for sandbox status",
+    (sandboxStatus, shouldShow) => {
+      renderWithProviders(
+        <ConversationCardActions
+          contextMenuOpen={true}
+          onContextMenuToggle={vi.fn()}
+          onStop={vi.fn()}
+          sandboxStatus={sandboxStatus}
+        />,
+      );
+
+      const stopButton = screen.queryByTestId("stop-button");
+
+      if (shouldShow) {
+        expect(stopButton).toBeInTheDocument();
+      } else {
+        expect(stopButton).not.toBeInTheDocument();
+      }
+    },
+  );
 });

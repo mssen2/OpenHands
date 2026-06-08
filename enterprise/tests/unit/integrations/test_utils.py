@@ -1,159 +1,135 @@
 """Tests for enterprise integrations utils module."""
 
-import pytest
-from integrations.utils import get_summary_for_agent_state
+from integrations.utils import (
+    HOST_URL,
+    get_session_expired_message,
+    get_user_not_found_message,
+)
 
-from openhands.core.schema.agent import AgentState
-from openhands.events.observation.agent import AgentStateChangedObservation
+
+class TestGetSessionExpiredMessage:
+    """Test cases for get_session_expired_message function."""
+
+    def test_message_with_username_contains_at_prefix(self):
+        """Test that the message contains the username with @ prefix."""
+        result = get_session_expired_message('testuser')
+        assert '@testuser' in result
+
+    def test_message_with_username_contains_session_expired_text(self):
+        """Test that the message contains session expired text."""
+        result = get_session_expired_message('testuser')
+        assert 'session has expired' in result
+
+    def test_message_with_username_contains_login_instruction(self):
+        """Test that the message contains login instruction."""
+        result = get_session_expired_message('testuser')
+        assert 'login again' in result
+
+    def test_message_with_username_contains_host_url(self):
+        """Test that the message contains the OpenHands Cloud URL."""
+        result = get_session_expired_message('testuser')
+        assert HOST_URL in result
+        assert 'OpenHands Cloud' in result
+
+    def test_different_usernames(self):
+        """Test that different usernames produce different messages."""
+        result1 = get_session_expired_message('user1')
+        result2 = get_session_expired_message('user2')
+        assert '@user1' in result1
+        assert '@user2' in result2
+        assert '@user1' not in result2
+        assert '@user2' not in result1
+
+    def test_message_without_username_contains_session_expired_text(self):
+        """Test that the message without username contains session expired text."""
+        result = get_session_expired_message()
+        assert 'session has expired' in result
+
+    def test_message_without_username_contains_login_instruction(self):
+        """Test that the message without username contains login instruction."""
+        result = get_session_expired_message()
+        assert 'login again' in result
+
+    def test_message_without_username_contains_host_url(self):
+        """Test that the message without username contains the OpenHands Cloud URL."""
+        result = get_session_expired_message()
+        assert HOST_URL in result
+        assert 'OpenHands Cloud' in result
+
+    def test_message_without_username_does_not_contain_at_prefix(self):
+        """Test that the message without username does not contain @ prefix."""
+        result = get_session_expired_message()
+        assert not result.startswith('@')
+        assert 'Your session' in result
+
+    def test_message_with_none_username(self):
+        """Test that passing None explicitly works the same as no argument."""
+        result = get_session_expired_message(None)
+        assert not result.startswith('@')
+        assert 'Your session' in result
 
 
-class TestGetSummaryForAgentState:
-    """Test cases for get_summary_for_agent_state function."""
+class TestGetUserNotFoundMessage:
+    """Test cases for get_user_not_found_message function.
 
-    def setup_method(self):
-        """Set up test fixtures."""
-        self.conversation_link = 'https://example.com/conversation/123'
+    This function is used to notify users when they try to use OpenHands features
+    but haven't created an OpenHands account yet (no Keycloak account exists).
+    """
 
-    def test_empty_observations_list(self):
-        """Test handling of empty observations list."""
-        result = get_summary_for_agent_state([], self.conversation_link)
+    def test_message_with_username_contains_at_prefix(self):
+        """Test that the message contains the username with @ prefix."""
+        result = get_user_not_found_message('testuser')
+        assert '@testuser' in result
 
-        assert 'unknown error' in result.lower()
-        assert self.conversation_link in result
+    def test_message_with_username_contains_sign_up_text(self):
+        """Test that the message contains sign up text."""
+        result = get_user_not_found_message('testuser')
+        assert "haven't created an OpenHands account" in result
 
-    @pytest.mark.parametrize(
-        'state,expected_text,includes_link',
-        [
-            (AgentState.RATE_LIMITED, 'rate limited', False),
-            (AgentState.AWAITING_USER_INPUT, 'waiting for your input', True),
-        ],
-    )
-    def test_handled_agent_states(self, state, expected_text, includes_link):
-        """Test handling of states with specific behavior."""
-        observation = AgentStateChangedObservation(
-            content=f'Agent state: {state.value}', agent_state=state
-        )
+    def test_message_with_username_contains_sign_up_instruction(self):
+        """Test that the message contains sign up instruction."""
+        result = get_user_not_found_message('testuser')
+        assert 'sign up' in result.lower()
 
-        result = get_summary_for_agent_state([observation], self.conversation_link)
+    def test_message_with_username_contains_host_url(self):
+        """Test that the message contains the OpenHands Cloud URL."""
+        result = get_user_not_found_message('testuser')
+        assert HOST_URL in result
+        assert 'OpenHands Cloud' in result
 
-        assert expected_text in result.lower()
-        if includes_link:
-            assert self.conversation_link in result
-        else:
-            assert self.conversation_link not in result
+    def test_different_usernames(self):
+        """Test that different usernames produce different messages."""
+        result1 = get_user_not_found_message('user1')
+        result2 = get_user_not_found_message('user2')
+        assert '@user1' in result1
+        assert '@user2' in result2
+        assert '@user1' not in result2
+        assert '@user2' not in result1
 
-    @pytest.mark.parametrize(
-        'state',
-        [
-            AgentState.FINISHED,
-            AgentState.PAUSED,
-            AgentState.STOPPED,
-            AgentState.AWAITING_USER_CONFIRMATION,
-        ],
-    )
-    def test_unhandled_agent_states(self, state):
-        """Test handling of unhandled states (should all return unknown error)."""
-        observation = AgentStateChangedObservation(
-            content=f'Agent state: {state.value}', agent_state=state
-        )
+    def test_message_without_username_contains_sign_up_text(self):
+        """Test that the message without username contains sign up text."""
+        result = get_user_not_found_message()
+        assert "haven't created an OpenHands account" in result
 
-        result = get_summary_for_agent_state([observation], self.conversation_link)
+    def test_message_without_username_contains_sign_up_instruction(self):
+        """Test that the message without username contains sign up instruction."""
+        result = get_user_not_found_message()
+        assert 'sign up' in result.lower()
 
-        assert 'unknown error' in result.lower()
-        assert self.conversation_link in result
+    def test_message_without_username_contains_host_url(self):
+        """Test that the message without username contains the OpenHands Cloud URL."""
+        result = get_user_not_found_message()
+        assert HOST_URL in result
+        assert 'OpenHands Cloud' in result
 
-    @pytest.mark.parametrize(
-        'error_code,expected_text',
-        [
-            (
-                'STATUS$ERROR_LLM_AUTHENTICATION',
-                'authentication with the llm provider failed',
-            ),
-            (
-                'STATUS$ERROR_LLM_SERVICE_UNAVAILABLE',
-                'llm service is temporarily unavailable',
-            ),
-            (
-                'STATUS$ERROR_LLM_INTERNAL_SERVER_ERROR',
-                'llm provider encountered an internal error',
-            ),
-            ('STATUS$ERROR_LLM_OUT_OF_CREDITS', "you've run out of credits"),
-            ('STATUS$ERROR_LLM_CONTENT_POLICY_VIOLATION', 'content policy violation'),
-        ],
-    )
-    def test_error_state_readable_reasons(self, error_code, expected_text):
-        """Test all readable error reason mappings."""
-        observation = AgentStateChangedObservation(
-            content=f'Agent encountered error: {error_code}',
-            agent_state=AgentState.ERROR,
-            reason=error_code,
-        )
+    def test_message_without_username_does_not_contain_at_prefix(self):
+        """Test that the message without username does not contain @ prefix."""
+        result = get_user_not_found_message()
+        assert not result.startswith('@')
+        assert 'It looks like' in result
 
-        result = get_summary_for_agent_state([observation], self.conversation_link)
-
-        assert 'encountered an error' in result.lower()
-        assert expected_text in result.lower()
-        assert self.conversation_link in result
-
-    def test_error_state_with_custom_reason(self):
-        """Test handling of ERROR state with a custom reason."""
-        observation = AgentStateChangedObservation(
-            content='Agent encountered an error',
-            agent_state=AgentState.ERROR,
-            reason='Test error message',
-        )
-
-        result = get_summary_for_agent_state([observation], self.conversation_link)
-
-        assert 'encountered an error' in result.lower()
-        assert 'test error message' in result.lower()
-        assert self.conversation_link in result
-
-    def test_multiple_observations_uses_first(self):
-        """Test that when multiple observations are provided, only the first is used."""
-        observation1 = AgentStateChangedObservation(
-            content='Agent is awaiting user input',
-            agent_state=AgentState.AWAITING_USER_INPUT,
-        )
-        observation2 = AgentStateChangedObservation(
-            content='Agent encountered an error',
-            agent_state=AgentState.ERROR,
-            reason='Should not be used',
-        )
-
-        result = get_summary_for_agent_state(
-            [observation1, observation2], self.conversation_link
-        )
-
-        # Should handle the first observation (AWAITING_USER_INPUT), not the second (ERROR)
-        assert 'waiting for your input' in result.lower()
-        assert 'error' not in result.lower()
-
-    def test_awaiting_user_input_specific_message(self):
-        """Test that AWAITING_USER_INPUT returns the specific expected message."""
-        observation = AgentStateChangedObservation(
-            content='Agent is awaiting user input',
-            agent_state=AgentState.AWAITING_USER_INPUT,
-        )
-
-        result = get_summary_for_agent_state([observation], self.conversation_link)
-
-        # Test the exact message format
-        assert 'waiting for your input' in result.lower()
-        assert 'continue the conversation' in result.lower()
-        assert self.conversation_link in result
-        assert 'unknown error' not in result.lower()
-
-    def test_rate_limited_specific_message(self):
-        """Test that RATE_LIMITED returns the specific expected message."""
-        observation = AgentStateChangedObservation(
-            content='Agent was rate limited', agent_state=AgentState.RATE_LIMITED
-        )
-
-        result = get_summary_for_agent_state([observation], self.conversation_link)
-
-        # Test the exact message format
-        assert 'rate limited' in result.lower()
-        assert 'try again later' in result.lower()
-        # RATE_LIMITED doesn't include conversation link in response
-        assert self.conversation_link not in result
+    def test_message_with_none_username(self):
+        """Test that passing None explicitly works the same as no argument."""
+        result = get_user_not_found_message(None)
+        assert not result.startswith('@')
+        assert 'It looks like' in result

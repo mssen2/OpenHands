@@ -1,49 +1,50 @@
+import React from "react";
 import { useTranslation } from "react-i18next";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import remarkBreaks from "remark-breaks";
 import { I18nKey } from "#/i18n/declaration";
 import LessonPlanIcon from "#/icons/lesson-plan.svg?react";
-import { useConversationStore } from "#/state/conversation-store";
-import { code } from "#/components/features/markdown/code";
-import { ul, ol } from "#/components/features/markdown/list";
-import { paragraph } from "#/components/features/markdown/paragraph";
-import { anchor } from "#/components/features/markdown/anchor";
-import {
-  h1,
-  h2,
-  h3,
-  h4,
-  h5,
-  h6,
-} from "#/components/features/markdown/headings";
+import { useConversationStore } from "#/stores/conversation-store";
+import { useScrollToBottom } from "#/hooks/use-scroll-to-bottom";
+import { MarkdownRenderer } from "#/components/features/markdown/markdown-renderer";
+import { planComponents } from "#/components/features/markdown/plan-components";
+import { useHandlePlanClick } from "#/hooks/use-handle-plan-click";
+import { cn } from "#/utils/utils";
+import { useAgentState } from "#/hooks/use-agent-state";
 
 function PlannerTab() {
   const { t } = useTranslation();
+  const scrollRef = React.useRef<HTMLDivElement>(null);
+  const {
+    scrollRef: scrollContainerRef,
+    onChatBodyScroll,
+    autoScroll,
+    scrollDomToBottom,
+  } = useScrollToBottom(scrollRef);
 
-  const { planContent, setConversationMode } = useConversationStore();
+  const { planContent, conversationMode } = useConversationStore();
+  const { isArchived } = useAgentState();
 
-  if (planContent) {
+  // Auto-scroll to bottom when plan content changes
+  React.useEffect(() => {
+    if (autoScroll) {
+      scrollDomToBottom();
+    }
+  }, [planContent, autoScroll, scrollDomToBottom]);
+  const isPlanMode = conversationMode === "plan";
+  const { handlePlanClick } = useHandlePlanClick();
+
+  // Disable button for archived conversations or when already in plan mode
+  const isButtonDisabled = isPlanMode || isArchived;
+
+  if (planContent !== null && planContent !== undefined) {
     return (
-      <div className="flex flex-col w-full h-full p-4 overflow-auto">
-        <Markdown
-          components={{
-            code,
-            ul,
-            ol,
-            a: anchor,
-            p: paragraph,
-            h1,
-            h2,
-            h3,
-            h4,
-            h5,
-            h6,
-          }}
-          remarkPlugins={[remarkGfm, remarkBreaks]}
-        >
+      <div
+        ref={scrollContainerRef}
+        onScroll={(e) => onChatBodyScroll(e.currentTarget)}
+        className="flex flex-col w-full h-full p-4 overflow-auto"
+      >
+        <MarkdownRenderer includeStandard components={planComponents}>
           {planContent}
-        </Markdown>
+        </MarkdownRenderer>
       </div>
     );
   }
@@ -56,8 +57,14 @@ function PlannerTab() {
       </span>
       <button
         type="button"
-        onClick={() => setConversationMode("plan")}
-        className="flex w-[164px] h-[40px] p-2 justify-center items-center shrink-0 rounded-lg bg-white overflow-hidden text-black text-ellipsis font-sans text-[16px] not-italic font-normal leading-[20px] hover:cursor-pointer hover:opacity-80"
+        onClick={handlePlanClick}
+        disabled={isButtonDisabled}
+        className={cn(
+          "flex w-[164px] h-[40px] p-2 justify-center items-center shrink-0 rounded-lg bg-white overflow-hidden text-black text-ellipsis font-sans text-[16px] not-italic font-normal leading-[20px]",
+          isButtonDisabled
+            ? "opacity-50 cursor-not-allowed"
+            : "hover:cursor-pointer hover:opacity-80",
+        )}
       >
         {t(I18nKey.COMMON$CREATE_A_PLAN)}
       </button>

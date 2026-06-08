@@ -1,8 +1,9 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { usePostHog } from "posthog-js/react";
 import AuthService from "#/api/auth-service/auth-service.api";
-import { useConfig } from "../query/use-config";
 import { clearLoginData } from "#/utils/local-storage";
+import { SETTINGS_QUERY_KEYS } from "../query/query-keys";
+import { useConfig } from "../query/use-config";
 
 export const useLogout = () => {
   const posthog = usePostHog();
@@ -10,15 +11,15 @@ export const useLogout = () => {
   const { data: config } = useConfig();
 
   return useMutation({
-    mutationFn: () => AuthService.logout(config?.APP_MODE ?? "oss"),
+    mutationFn: () => AuthService.logout(config?.app_mode ?? "oss"),
     onSuccess: async () => {
       queryClient.removeQueries({ queryKey: ["tasks"] });
-      queryClient.removeQueries({ queryKey: ["settings"] });
+      queryClient.removeQueries({ queryKey: SETTINGS_QUERY_KEYS.all });
       queryClient.removeQueries({ queryKey: ["user"] });
       queryClient.removeQueries({ queryKey: ["secrets"] });
 
       // Clear login method and last page from local storage
-      if (config?.APP_MODE === "saas") {
+      if (config?.app_mode === "saas") {
         clearLoginData();
       }
 

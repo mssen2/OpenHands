@@ -1,12 +1,8 @@
-from fastapi.staticfiles import StaticFiles
-from starlette.responses import Response
-from starlette.types import Scope
+# DEPRECATED: This module is deprecated and will be removed in a future release.
+# Please use openhands.app_server.static instead.
+#
+# For backward compatibility, this module re-exports from openhands.app_server.static.
 
+from openhands.app_server.static import SPAStaticFiles
 
-class SPAStaticFiles(StaticFiles):
-    async def get_response(self, path: str, scope: Scope) -> Response:
-        try:
-            return await super().get_response(path, scope)
-        except Exception:
-            # FIXME: just making this HTTPException doesn't work for some reason
-            return await super().get_response('index.html', scope)
+__all__ = ['SPAStaticFiles']

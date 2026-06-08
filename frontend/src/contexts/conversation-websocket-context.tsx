@@ -10,10 +10,14 @@ import React, {
 import { useQueryClient } from "@tanstack/react-query";
 import { useWebSocket, WebSocketHookOptions } from "#/hooks/use-websocket";
 import { useEventStore } from "#/stores/use-event-store";
+import { useModelStore } from "#/stores/model-store";
+import { getRenderedV1Events } from "#/components/v1/chat/event-content-helpers/should-render-event";
+import { updateConversationLlmModelInCache } from "#/hooks/mutation/conversation-mutation-utils";
 import { useErrorMessageStore } from "#/stores/error-message-store";
 import { useOptimisticUserMessageStore } from "#/stores/optimistic-user-message-store";
 import { useV1ConversationStateStore } from "#/stores/v1-conversation-state-store";
-import { useCommandStore } from "#/state/command-store";
+import { useCommandStore } from "#/stores/command-store";
+import { useBrowserStore } from "#/stores/browser-store";
 import {
   isV1Event,
   isAgentErrorEvent,
@@ -22,15 +26,35 @@ import {
   isConversationStateUpdateEvent,
   isFullStateConversationStateUpdateEvent,
   isAgentStatusConversationStateUpdateEvent,
+  isStatsConversationStateUpdateEvent,
+  isSwitchLLMObservationEvent,
   isExecuteBashActionEvent,
   isExecuteBashObservationEvent,
+  isDisplayableErrorEvent,
+  isPlanningFileEditorObservationEvent,
+  isBrowserObservationEvent,
+  isBrowserNavigateActionEvent,
 } from "#/types/v1/type-guards";
+import { ConversationStateUpdateEventStats } from "#/types/v1/core/events/conversation-state-event";
+import type {
+  ConversationErrorEvent,
+  ServerErrorEvent,
+} from "#/types/v1/core/events/conversation-state-event";
 import { handleActionEventCacheInvalidation } from "#/utils/cache-utils";
 import { buildWebSocketUrl } from "#/utils/websocket-url";
-import { isBudgetOrCreditError } from "#/utils/error-handler";
-import type { V1SendMessageRequest } from "#/api/conversation-service/v1-conversation-service.types";
+import type {
+  V1AppConversation,
+  V1SendMessageRequest,
+} from "#/api/conversation-service/v1-conversation-service.types";
 import EventService from "#/api/event-service/event-service.api";
-import { useTracking } from "#/hooks/use-tracking";
+import PendingMessageService from "#/api/pending-message-service/pending-message-service.api";
+import { useConversationStore } from "#/stores/conversation-store";
+import { isBudgetOrCreditError, trackError } from "#/utils/error-handler";
+import { useReadConversationFile } from "#/hooks/mutation/use-read-conversation-file";
+import useMetricsStore from "#/stores/metrics-store";
+import { I18nKey } from "#/i18n/declaration";
+import { useConversationHistory } from "#/hooks/query/use-conversation-history";
+import { setConversationState } from "#/utils/conversation-local-storage";
 
 // eslint-disable-next-line @typescript-eslint/naming-convention
 export type V1_WebSocketConnectionState =
@@ -39,9 +63,13 @@ export type V1_WebSocketConnectionState =
   | "CLOSED"
   | "CLOSING";
 
+interface SendMessageResult {
+  queued: boolean; // true if message was queued for later delivery, false if sent immediately
+}
+
 interface ConversationWebSocketContextType {
   connectionState: V1_WebSocketConnectionState;
-  sendMessage: (message: V1SendMessageRequest) => Promise<void>;
+  sendMessage: (message: V1SendMessageRequest) => Promise<SendMessageResult>;
   isLoadingHistory: boolean;
 }
 
@@ -54,31 +82,112 @@ export function ConversationWebSocketProvider({
   conversationId,
   conversationUrl,
   sessionApiKey,
+  subConversations,
+  subConversationIds,
 }: {
   children: React.ReactNode;
   conversationId?: string;
   conversationUrl?: string | null;
   sessionApiKey?: string | null;
+  subConversations?: V1AppConversation[];
+  subConversationIds?: string[];
 }) {
-  const [connectionState, setConnectionState] =
+  // Separate connection state tracking for each WebSocket
+  const [mainConnectionState, setMainConnectionState] =
     useState<V1_WebSocketConnectionState>("CONNECTING");
-  // Track if we've ever successfully connected
+  const [planningConnectionState, setPlanningConnectionState] =
+    useState<V1_WebSocketConnectionState>("CONNECTING");
+
+  // Track if we've ever successfully connected for each connection
   // Don't show errors until after first successful connection
-  const hasConnectedRef = React.useRef(false);
+  const hasConnectedRefMain = React.useRef(false);
+  const hasConnectedRefPlanning = React.useRef(false);
+
   const queryClient = useQueryClient();
   const { addEvent } = useEventStore();
   const { setErrorMessage, removeErrorMessage } = useErrorMessageStore();
   const { removeOptimisticUserMessage } = useOptimisticUserMessageStore();
   const { setExecutionStatus } = useV1ConversationStateStore();
   const { appendInput, appendOutput } = useCommandStore();
-  const { trackCreditLimitReached } = useTracking();
 
-  // History loading state
-  const [isLoadingHistory, setIsLoadingHistory] = useState(true);
-  const [expectedEventCount, setExpectedEventCount] = useState<number | null>(
-    null,
+  // History loading state - separate per connection
+  const [isLoadingHistoryMain, setIsLoadingHistoryMain] = useState(true);
+  const [isLoadingHistoryPlanning, setIsLoadingHistoryPlanning] =
+    useState(true);
+  const [expectedEventCountMain, setExpectedEventCountMain] = useState<
+    number | null
+  >(null);
+  const [expectedEventCountPlanning, setExpectedEventCountPlanning] = useState<
+    number | null
+  >(null);
+
+  const { setPlanContent } = useConversationStore();
+
+  // Hook for reading conversation file
+  const { mutate: readConversationFile } = useReadConversationFile();
+
+  // Separate received event count tracking per connection
+  const receivedEventCountRefMain = useRef(0);
+  const receivedEventCountRefPlanning = useRef(0);
+
+  // Track the latest PlanningFileEditorObservation for Plan.md during history replay
+  const latestPlanningFileEventRef = useRef<{
+    path: string;
+    conversationId: string;
+  } | null>(null);
+
+  const isPlanFilePath = (path: string | null): boolean =>
+    path?.toUpperCase().endsWith("PLAN.MD") ?? false;
+
+  // Helper to handle error clearing logic for non-error events.
+  // Budget/credit errors persist until an agent event proves the LLM is working.
+  const handleNonErrorEvent = useCallback(
+    (event: { source?: string }) => {
+      const currentError = useErrorMessageStore.getState().errorMessage;
+      const isBudgetError =
+        currentError === I18nKey.STATUS$ERROR_LLM_OUT_OF_CREDITS;
+      const isAgentEvent = event.source === "agent";
+
+      // Budget errors persist until agent proves LLM is working
+      if (isBudgetError && !isAgentEvent) {
+        return; // Keep budget error visible
+      }
+
+      removeErrorMessage();
+    },
+    [removeErrorMessage],
   );
-  const receivedEventCountRef = useRef(0);
+
+  // Helper function to update metrics from stats event
+  const updateMetricsFromStats = useCallback(
+    (event: ConversationStateUpdateEventStats) => {
+      if (event.value.usage_to_metrics?.agent) {
+        const agentMetrics = event.value.usage_to_metrics.agent;
+        const metrics = {
+          cost: agentMetrics.accumulated_cost,
+          max_budget_per_task: agentMetrics.max_budget_per_task ?? null,
+          usage: agentMetrics.accumulated_token_usage
+            ? {
+                prompt_tokens:
+                  agentMetrics.accumulated_token_usage.prompt_tokens,
+                completion_tokens:
+                  agentMetrics.accumulated_token_usage.completion_tokens,
+                cache_read_tokens:
+                  agentMetrics.accumulated_token_usage.cache_read_tokens,
+                cache_write_tokens:
+                  agentMetrics.accumulated_token_usage.cache_write_tokens,
+                context_window:
+                  agentMetrics.accumulated_token_usage.context_window,
+                per_turn_token:
+                  agentMetrics.accumulated_token_usage.per_turn_token,
+              }
+            : null,
+        };
+        useMetricsStore.getState().setMetrics(metrics);
+      }
+    },
+    [],
+  );
 
   // Build WebSocket URL from props
   // Only build URL if we have both conversationId and conversationUrl
@@ -91,40 +200,183 @@ export function ConversationWebSocketProvider({
     return buildWebSocketUrl(conversationId, conversationUrl);
   }, [conversationId, conversationUrl]);
 
-  // Reset hasConnected flag and history loading state when conversation changes
-  useEffect(() => {
-    hasConnectedRef.current = false;
-    setIsLoadingHistory(true);
-    setExpectedEventCount(null);
-    receivedEventCountRef.current = 0;
-  }, [conversationId]);
+  const planningAgentWsUrl = useMemo(() => {
+    if (!subConversations?.length) {
+      return null;
+    }
 
-  // Check if we've received all events when expectedEventCount becomes available
+    // Currently, there is only one sub-conversation and it uses the planning agent.
+    const planningAgentConversation = subConversations[0];
+
+    if (
+      !planningAgentConversation?.id ||
+      !planningAgentConversation.conversation_url
+    ) {
+      return null;
+    }
+
+    return buildWebSocketUrl(
+      planningAgentConversation.id,
+      planningAgentConversation.conversation_url,
+    );
+  }, [subConversations]);
+
+  // Merged connection state - reflects combined status of both connections
+  const connectionState = useMemo<V1_WebSocketConnectionState>(() => {
+    // If planning agent connection doesn't exist, use main connection state
+    if (!planningAgentWsUrl) {
+      return mainConnectionState;
+    }
+
+    // If either is connecting, merged state is connecting
+    if (
+      mainConnectionState === "CONNECTING" ||
+      planningConnectionState === "CONNECTING"
+    ) {
+      return "CONNECTING";
+    }
+
+    // If both are open, merged state is open
+    if (mainConnectionState === "OPEN" && planningConnectionState === "OPEN") {
+      return "OPEN";
+    }
+
+    // If both are closed, merged state is closed
+    if (
+      mainConnectionState === "CLOSED" &&
+      planningConnectionState === "CLOSED"
+    ) {
+      return "CLOSED";
+    }
+
+    // If either is closing, merged state is closing
+    if (
+      mainConnectionState === "CLOSING" ||
+      planningConnectionState === "CLOSING"
+    ) {
+      return "CLOSING";
+    }
+
+    // Default to closed if states don't match expected patterns
+    return "CLOSED";
+  }, [mainConnectionState, planningConnectionState, planningAgentWsUrl]);
+
   useEffect(() => {
     if (
-      expectedEventCount !== null &&
-      receivedEventCountRef.current >= expectedEventCount &&
-      isLoadingHistory
+      expectedEventCountMain !== null &&
+      receivedEventCountRefMain.current >= expectedEventCountMain &&
+      isLoadingHistoryMain
     ) {
-      setIsLoadingHistory(false);
+      setIsLoadingHistoryMain(false);
     }
-  }, [expectedEventCount, isLoadingHistory]);
+  }, [expectedEventCountMain, isLoadingHistoryMain, receivedEventCountRefMain]);
 
-  const handleMessage = useCallback(
+  useEffect(() => {
+    if (
+      expectedEventCountPlanning !== null &&
+      receivedEventCountRefPlanning.current >= expectedEventCountPlanning &&
+      isLoadingHistoryPlanning
+    ) {
+      setIsLoadingHistoryPlanning(false);
+    }
+  }, [
+    expectedEventCountPlanning,
+    isLoadingHistoryPlanning,
+    receivedEventCountRefPlanning,
+  ]);
+
+  // Call API once after history loading completes if we tracked any PlanningFileEditorObservation events
+  useEffect(() => {
+    if (!isLoadingHistoryPlanning && latestPlanningFileEventRef.current) {
+      const { path, conversationId: currentPlanningConversationId } =
+        latestPlanningFileEventRef.current;
+
+      readConversationFile(
+        {
+          conversationId: currentPlanningConversationId,
+          filePath: path,
+        },
+        {
+          onSuccess: (fileContent) => {
+            setPlanContent(fileContent);
+          },
+          onError: (error) => {
+            // eslint-disable-next-line no-console
+            console.warn("Failed to read conversation file:", error);
+          },
+        },
+      );
+
+      // Clear the ref after calling the API
+      latestPlanningFileEventRef.current = null;
+    }
+  }, [isLoadingHistoryPlanning, readConversationFile, setPlanContent]);
+
+  useEffect(() => {
+    hasConnectedRefMain.current = false;
+    setIsLoadingHistoryPlanning(!!subConversationIds?.length);
+    setExpectedEventCountPlanning(null);
+    receivedEventCountRefPlanning.current = 0;
+    // Reset the tracked event ref when sub-conversations change
+    latestPlanningFileEventRef.current = null;
+  }, [subConversationIds]);
+
+  // Merged loading history state - true if either connection is still loading
+  const isLoadingHistory = useMemo(
+    () => isLoadingHistoryMain || isLoadingHistoryPlanning,
+    [isLoadingHistoryMain, isLoadingHistoryPlanning],
+  );
+
+  // Reset hasConnected flags and history loading state when conversation changes
+  useEffect(() => {
+    hasConnectedRefPlanning.current = false;
+    setIsLoadingHistoryMain(true);
+    setExpectedEventCountMain(null);
+    receivedEventCountRefMain.current = 0;
+    // Reset the tracked event ref when conversation changes
+    latestPlanningFileEventRef.current = null;
+  }, [conversationId]);
+
+  const { data: preloadedEvents, isFetched: isHistoryFetched } =
+    useConversationHistory(conversationId);
+
+  useEffect(() => {
+    // Don't do anything until the history query has completed
+    // This prevents prematurely setting loading to false before data is available
+    if (!isHistoryFetched) {
+      return;
+    }
+
+    // If no events (empty conversation or query returned empty), just stop loading
+    if (!preloadedEvents || preloadedEvents.length === 0) {
+      setIsLoadingHistoryMain(false);
+      return;
+    }
+
+    // Add all preloaded events to the store
+    for (const event of preloadedEvents) {
+      addEvent(event);
+    }
+
+    setIsLoadingHistoryMain(false);
+  }, [preloadedEvents, isHistoryFetched, addEvent]);
+
+  // Separate message handlers for each connection
+  const handleMainMessage = useCallback(
     (messageEvent: MessageEvent) => {
       try {
         const event = JSON.parse(messageEvent.data);
 
         // Track received events for history loading (count ALL events from WebSocket)
         // Always count when loading, even if we don't have the expected count yet
-        if (isLoadingHistory) {
-          receivedEventCountRef.current += 1;
+        if (isLoadingHistoryMain) {
+          receivedEventCountRefMain.current += 1;
 
           if (
-            expectedEventCount !== null &&
-            receivedEventCountRef.current >= expectedEventCount
+            expectedEventCountMain !== null &&
+            receivedEventCountRefMain.current >= expectedEventCountMain
           ) {
-            setIsLoadingHistory(false);
+            setIsLoadingHistoryMain(false);
           }
         }
 
@@ -132,21 +384,55 @@ export function ConversationWebSocketProvider({
         if (isV1Event(event)) {
           addEvent(event);
 
-          // Handle AgentErrorEvent specifically
-          if (isAgentErrorEvent(event)) {
-            setErrorMessage(event.error);
+          // Handle displayable error events - show error banner
+          // AgentErrorEvent errors are displayed inline in the chat, not as banners
+          if (isDisplayableErrorEvent(event)) {
+            const errorEvent = event as
+              | ConversationErrorEvent
+              | ServerErrorEvent;
+            trackError({
+              message: errorEvent.detail,
+              source: "conversation",
+              metadata: {
+                eventId: errorEvent.id,
+                errorCode: errorEvent.code,
+              },
+            });
+            if (isBudgetOrCreditError(errorEvent.detail)) {
+              setErrorMessage(I18nKey.STATUS$ERROR_LLM_OUT_OF_CREDITS);
+            } else {
+              setErrorMessage(errorEvent.detail);
+            }
+          } else {
+            handleNonErrorEvent(event);
+          }
 
-            // Track credit limit reached if the error is budget-related
+          // Track credit limit reached if AgentErrorEvent has budget-related error
+          if (isAgentErrorEvent(event)) {
+            trackError({
+              message: event.error,
+              source: "agent",
+              metadata: {
+                eventId: event.id,
+                toolName: event.tool_name,
+                toolCallId: event.tool_call_id,
+              },
+            });
+            // Use friendly i18n message for budget/credit errors instead of raw error
             if (isBudgetOrCreditError(event.error)) {
-              trackCreditLimitReached({
-                conversationId: conversationId || "unknown",
-              });
+              setErrorMessage(I18nKey.STATUS$ERROR_LLM_OUT_OF_CREDITS);
+            } else {
+              setErrorMessage(event.error);
             }
           }
 
           // Clear optimistic user message when a user message is confirmed
           if (isUserMessageEvent(event)) {
             removeOptimisticUserMessage();
+            // Clear draft from localStorage - message was successfully delivered
+            if (conversationId) {
+              setConversationState(conversationId, { draftMessage: null });
+            }
           }
 
           // Handle cache invalidation for ActionEvent
@@ -169,6 +455,48 @@ export function ConversationWebSocketProvider({
             if (isAgentStatusConversationStateUpdateEvent(event)) {
               setExecutionStatus(event.value);
             }
+            if (isStatsConversationStateUpdateEvent(event)) {
+              updateMetricsFromStats(event);
+            }
+          }
+
+          // The agent switched its own LLM (via the built-in switch_llm tool).
+          // Mirror the manual-switch UX: record the new profile (so the
+          // switch-profile button flips by name, unambiguous even when several
+          // profiles share a model string) and patch the running model into the
+          // conversation cache so the chat header updates instantly.
+          //
+          // We deliberately do NOT invalidate the conversation query here. The
+          // app-server only learns of the switch via the webhook, which is
+          // batched (``event_buffer_size`` / ``flush_delay``), and the
+          // conversation endpoint reports the *persisted* ``llm_model`` (not the
+          // sandbox's live model). An immediate refetch would therefore read the
+          // pre-switch model and clobber the patch above. The persisted value
+          // catches up on the next poll once the webhook has flushed.
+          if (
+            conversationId &&
+            isSwitchLLMObservationEvent(event) &&
+            !event.observation.is_error
+          ) {
+            const last = getRenderedV1Events(
+              useEventStore.getState().uiEvents,
+            ).at(-1);
+            const anchorEventId = last ? String(last.id) : null;
+            useModelStore
+              .getState()
+              .recordSwitch(
+                conversationId,
+                anchorEventId,
+                event.observation.profile_name,
+              );
+
+            if (event.observation.active_model) {
+              updateConversationLlmModelInCache(
+                queryClient,
+                conversationId,
+                event.observation.active_model,
+              );
+            }
           }
 
           // Handle ExecuteBashAction events - add command as input to terminal
@@ -185,6 +513,22 @@ export function ConversationWebSocketProvider({
               .join("\n");
             appendOutput(textContent);
           }
+
+          // Handle BrowserObservation events - update browser store with screenshot
+          if (isBrowserObservationEvent(event)) {
+            const { screenshot_data: screenshotData } = event.observation;
+            if (screenshotData) {
+              const screenshotSrc = screenshotData.startsWith("data:")
+                ? screenshotData
+                : `data:image/png;base64,${screenshotData}`;
+              useBrowserStore.getState().setScreenshotSrc(screenshotSrc);
+            }
+          }
+
+          // Handle BrowserNavigateAction events - update browser store with URL
+          if (isBrowserNavigateActionEvent(event)) {
+            useBrowserStore.getState().setUrl(event.action.url);
+          }
         }
       } catch (error) {
         // eslint-disable-next-line no-console
@@ -193,19 +537,203 @@ export function ConversationWebSocketProvider({
     },
     [
       addEvent,
-      isLoadingHistory,
-      expectedEventCount,
+      isLoadingHistoryMain,
+      expectedEventCountMain,
       setErrorMessage,
+      removeErrorMessage,
       removeOptimisticUserMessage,
       queryClient,
       conversationId,
       setExecutionStatus,
       appendInput,
       appendOutput,
+      updateMetricsFromStats,
     ],
   );
 
-  const websocketOptions: WebSocketHookOptions = useMemo(() => {
+  const handlePlanningMessage = useCallback(
+    (messageEvent: MessageEvent) => {
+      try {
+        const event = JSON.parse(messageEvent.data);
+
+        // Track received events for history loading (count ALL events from WebSocket)
+        // Always count when loading, even if we don't have the expected count yet
+        if (isLoadingHistoryPlanning) {
+          receivedEventCountRefPlanning.current += 1;
+
+          if (
+            expectedEventCountPlanning !== null &&
+            receivedEventCountRefPlanning.current >= expectedEventCountPlanning
+          ) {
+            setIsLoadingHistoryPlanning(false);
+          }
+        }
+
+        // Use type guard to validate v1 event structure
+        if (isV1Event(event)) {
+          // Mark this event as coming from the planning agent
+          const eventWithPlanningFlag = {
+            ...event,
+            isFromPlanningAgent: true,
+          };
+          addEvent(eventWithPlanningFlag);
+
+          // Handle displayable error events - show error banner
+          // AgentErrorEvent errors are displayed inline in the chat, not as banners
+          if (isDisplayableErrorEvent(event)) {
+            const errorEvent = event as
+              | ConversationErrorEvent
+              | ServerErrorEvent;
+            trackError({
+              message: errorEvent.detail,
+              source: "planning_conversation",
+              metadata: {
+                eventId: errorEvent.id,
+                errorCode: errorEvent.code,
+              },
+            });
+            if (isBudgetOrCreditError(errorEvent.detail)) {
+              setErrorMessage(I18nKey.STATUS$ERROR_LLM_OUT_OF_CREDITS);
+            } else {
+              setErrorMessage(errorEvent.detail);
+            }
+          } else {
+            handleNonErrorEvent(event);
+          }
+
+          // Handle AgentErrorEvent specifically
+          if (isAgentErrorEvent(event)) {
+            trackError({
+              message: event.error,
+              source: "planning_agent",
+              metadata: {
+                eventId: event.id,
+                toolName: event.tool_name,
+                toolCallId: event.tool_call_id,
+              },
+            });
+            // Use friendly i18n message for budget/credit errors instead of raw error
+            if (isBudgetOrCreditError(event.error)) {
+              setErrorMessage(I18nKey.STATUS$ERROR_LLM_OUT_OF_CREDITS);
+            } else {
+              setErrorMessage(event.error);
+            }
+          }
+
+          // Clear optimistic user message when a user message is confirmed
+          if (isUserMessageEvent(event)) {
+            removeOptimisticUserMessage();
+            // Clear draft from localStorage - message was successfully delivered
+            // Use main conversationId since user types in main conversation input
+            if (conversationId) {
+              setConversationState(conversationId, { draftMessage: null });
+            }
+          }
+
+          // Handle cache invalidation for ActionEvent
+          if (isActionEvent(event)) {
+            const planningAgentConversation = subConversations?.[0];
+            const currentConversationId =
+              planningAgentConversation?.id || "test-conversation-id"; // TODO: Get from context
+            handleActionEventCacheInvalidation(
+              event,
+              currentConversationId,
+              queryClient,
+            );
+          }
+
+          // Handle conversation state updates
+          // TODO: Tests
+          if (isConversationStateUpdateEvent(event)) {
+            if (isFullStateConversationStateUpdateEvent(event)) {
+              setExecutionStatus(event.value.execution_status);
+            }
+            if (isAgentStatusConversationStateUpdateEvent(event)) {
+              setExecutionStatus(event.value);
+            }
+            if (isStatsConversationStateUpdateEvent(event)) {
+              updateMetricsFromStats(event);
+            }
+          }
+
+          // Handle ExecuteBashAction events - add command as input to terminal
+          if (isExecuteBashActionEvent(event)) {
+            appendInput(event.action.command);
+          }
+
+          // Handle ExecuteBashObservation events - add output to terminal
+          if (isExecuteBashObservationEvent(event)) {
+            // Extract text content from the observation content array
+            const textContent = event.observation.content
+              .filter((c) => c.type === "text")
+              .map((c) => c.text)
+              .join("\n");
+            appendOutput(textContent);
+          }
+
+          // Handle PlanningFileEditorObservation - only update plan for Plan.md
+          if (isPlanningFileEditorObservationEvent(event)) {
+            const { path } = event.observation;
+            if (isPlanFilePath(path)) {
+              const planningAgentConversation = subConversations?.[0];
+              const planningConversationId = planningAgentConversation?.id;
+
+              if (planningConversationId && path) {
+                if (isLoadingHistoryPlanning) {
+                  latestPlanningFileEventRef.current = {
+                    path,
+                    conversationId: planningConversationId,
+                  };
+                } else {
+                  readConversationFile(
+                    {
+                      conversationId: planningConversationId,
+                      filePath: path,
+                    },
+                    {
+                      onSuccess: (fileContent) => {
+                        setPlanContent(fileContent);
+                      },
+                      onError: (error) => {
+                        // eslint-disable-next-line no-console
+                        console.warn(
+                          "Failed to read conversation file:",
+                          error,
+                        );
+                      },
+                    },
+                  );
+                }
+              }
+            }
+          }
+        }
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.warn("Failed to parse WebSocket message as JSON:", error);
+      }
+    },
+    [
+      addEvent,
+      isLoadingHistoryPlanning,
+      expectedEventCountPlanning,
+      setErrorMessage,
+      removeErrorMessage,
+      removeOptimisticUserMessage,
+      queryClient,
+      subConversations,
+      conversationId,
+      setExecutionStatus,
+      appendInput,
+      appendOutput,
+      readConversationFile,
+      setPlanContent,
+      updateMetricsFromStats,
+    ],
+  );
+
+  // Separate WebSocket options for main connection
+  const mainWebsocketOptions: WebSocketHookOptions = useMemo(() => {
     const queryParams: Record<string, string | boolean> = {
       resend_all: true,
     };
@@ -219,70 +747,171 @@ export function ConversationWebSocketProvider({
       queryParams,
       reconnect: { enabled: true },
       onOpen: async () => {
-        setConnectionState("OPEN");
-        hasConnectedRef.current = true; // Mark that we've successfully connected
+        setMainConnectionState("OPEN");
+        hasConnectedRefMain.current = true; // Mark that we've successfully connected
         removeErrorMessage(); // Clear any previous error messages on successful connection
 
         // Fetch expected event count for history loading detection
-        if (conversationId) {
+        if (conversationId && conversationUrl) {
           try {
-            const count = await EventService.getEventCount(conversationId);
-            setExpectedEventCount(count);
+            const count = await EventService.getEventCount(
+              conversationId,
+              conversationUrl,
+              sessionApiKey,
+            );
+            setExpectedEventCountMain(count);
 
             // If no events expected, mark as loaded immediately
             if (count === 0) {
-              setIsLoadingHistory(false);
+              setIsLoadingHistoryMain(false);
             }
           } catch (error) {
             // Fall back to marking as loaded to avoid infinite loading state
-            setIsLoadingHistory(false);
+            setIsLoadingHistoryMain(false);
           }
         }
       },
-      onClose: (event: CloseEvent) => {
-        setConnectionState("CLOSED");
-        // Only show error message if we've previously connected successfully
-        // This prevents showing errors during initial connection attempts (e.g., when auto-starting a conversation)
-        if (event.code !== 1000 && hasConnectedRef.current) {
-          setErrorMessage(
-            `Connection lost: ${event.reason || "Unexpected disconnect"}`,
-          );
-        }
+      onClose: () => {
+        setMainConnectionState("CLOSED");
+        // Recovery is handled by useSandboxRecovery on tab focus/page refresh
+        // No error message needed - silent recovery provides better UX
       },
       onError: () => {
-        setConnectionState("CLOSED");
+        setMainConnectionState("CLOSED");
         // Only show error message if we've previously connected successfully
-        if (hasConnectedRef.current) {
+        if (hasConnectedRefMain.current) {
           setErrorMessage("Failed to connect to server");
         }
       },
-      onMessage: handleMessage,
+      onMessage: handleMainMessage,
     };
   }, [
-    handleMessage,
+    handleMainMessage,
     setErrorMessage,
     removeErrorMessage,
     sessionApiKey,
     conversationId,
+    conversationUrl,
+  ]);
+
+  // Separate WebSocket options for planning agent connection
+  const planningWebsocketOptions: WebSocketHookOptions = useMemo(() => {
+    const queryParams: Record<string, string | boolean> = {
+      resend_all: true,
+    };
+
+    // Add session_api_key if available
+    if (sessionApiKey) {
+      queryParams.session_api_key = sessionApiKey;
+    }
+
+    const planningAgentConversation = subConversations?.[0];
+
+    return {
+      queryParams,
+      reconnect: { enabled: true },
+      onOpen: async () => {
+        setPlanningConnectionState("OPEN");
+        hasConnectedRefPlanning.current = true; // Mark that we've successfully connected
+        removeErrorMessage(); // Clear any previous error messages on successful connection
+
+        // Fetch expected event count for history loading detection
+        if (
+          planningAgentConversation?.id &&
+          planningAgentConversation.conversation_url
+        ) {
+          try {
+            const count = await EventService.getEventCount(
+              planningAgentConversation.id,
+              planningAgentConversation.conversation_url,
+              planningAgentConversation.session_api_key,
+            );
+            setExpectedEventCountPlanning(count);
+
+            // If no events expected, mark as loaded immediately
+            if (count === 0) {
+              setIsLoadingHistoryPlanning(false);
+            }
+          } catch (error) {
+            // Fall back to marking as loaded to avoid infinite loading state
+            setIsLoadingHistoryPlanning(false);
+          }
+        }
+      },
+      onClose: () => {
+        setPlanningConnectionState("CLOSED");
+        // Recovery is handled by useSandboxRecovery on tab focus/page refresh
+        // No error message needed - silent recovery provides better UX
+      },
+      onError: () => {
+        setPlanningConnectionState("CLOSED");
+        // Only show error message if we've previously connected successfully
+        if (hasConnectedRefPlanning.current) {
+          setErrorMessage("Failed to connect to server");
+        }
+      },
+      onMessage: handlePlanningMessage,
+    };
+  }, [
+    handlePlanningMessage,
+    setErrorMessage,
+    removeErrorMessage,
+    sessionApiKey,
+    subConversations,
   ]);
 
   // Only attempt WebSocket connection when we have a valid URL
   // This prevents connection attempts during task polling phase
   const websocketUrl = wsUrl;
-  const { socket } = useWebSocket(websocketUrl || "", websocketOptions);
+  const { socket: mainSocket } = useWebSocket(
+    websocketUrl || "",
+    mainWebsocketOptions,
+  );
+
+  const { socket: planningAgentSocket } = useWebSocket(
+    planningAgentWsUrl || "",
+    planningWebsocketOptions,
+  );
 
   // V1 send message function via WebSocket
+  // Falls back to REST API queue when WebSocket is not connected
   const sendMessage = useCallback(
-    async (message: V1SendMessageRequest) => {
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
-        const error = "WebSocket is not connected";
-        setErrorMessage(error);
-        throw new Error(error);
+    async (message: V1SendMessageRequest): Promise<SendMessageResult> => {
+      const currentMode = useConversationStore.getState().conversationMode;
+      const currentSocket =
+        currentMode === "plan" ? planningAgentSocket : mainSocket;
+
+      if (!currentSocket || currentSocket.readyState !== WebSocket.OPEN) {
+        // WebSocket not connected - queue message via REST API
+        // Message will be delivered automatically when conversation becomes ready
+        if (!conversationId) {
+          const error = new Error("No conversation ID available");
+          setErrorMessage(error.message);
+          throw error;
+        }
+
+        try {
+          await PendingMessageService.queueMessage(conversationId, {
+            role: "user",
+            content: message.content,
+          });
+          // Message queued successfully - it will be delivered when ready
+          // Return queued: true so caller knows not to show optimistic UI
+          return { queued: true };
+        } catch (error) {
+          const errorMessage =
+            error instanceof Error
+              ? error.message
+              : "Failed to queue message for delivery";
+          setErrorMessage(errorMessage);
+          throw error;
+        }
       }
 
       try {
         // Send message through WebSocket as JSON
-        socket.send(JSON.stringify(message));
+        currentSocket.send(JSON.stringify(message));
+        return { queued: false };
       } catch (error) {
         const errorMessage =
           error instanceof Error ? error.message : "Failed to send message";
@@ -290,36 +919,66 @@ export function ConversationWebSocketProvider({
         throw error;
       }
     },
-    [socket, setErrorMessage],
+    [mainSocket, planningAgentSocket, setErrorMessage, conversationId],
   );
 
+  // Track main socket state changes
   useEffect(() => {
     // Only process socket updates if we have a valid URL and socket
-    if (socket && wsUrl) {
+    if (mainSocket && wsUrl) {
       // Update state based on socket readyState
       const updateState = () => {
-        switch (socket.readyState) {
+        switch (mainSocket.readyState) {
           case WebSocket.CONNECTING:
-            setConnectionState("CONNECTING");
+            setMainConnectionState("CONNECTING");
             break;
           case WebSocket.OPEN:
-            setConnectionState("OPEN");
+            setMainConnectionState("OPEN");
             break;
           case WebSocket.CLOSING:
-            setConnectionState("CLOSING");
+            setMainConnectionState("CLOSING");
             break;
           case WebSocket.CLOSED:
-            setConnectionState("CLOSED");
+            setMainConnectionState("CLOSED");
             break;
           default:
-            setConnectionState("CLOSED");
+            setMainConnectionState("CLOSED");
             break;
         }
       };
 
       updateState();
     }
-  }, [socket, wsUrl]);
+  }, [mainSocket, wsUrl]);
+
+  // Track planning agent socket state changes
+  useEffect(() => {
+    // Only process socket updates if we have a valid URL and socket
+    if (planningAgentSocket && planningAgentWsUrl) {
+      // Update state based on socket readyState
+      const updateState = () => {
+        switch (planningAgentSocket.readyState) {
+          case WebSocket.CONNECTING:
+            setPlanningConnectionState("CONNECTING");
+            break;
+          case WebSocket.OPEN:
+            setPlanningConnectionState("OPEN");
+            break;
+          case WebSocket.CLOSING:
+            setPlanningConnectionState("CLOSING");
+            break;
+          case WebSocket.CLOSED:
+            setPlanningConnectionState("CLOSED");
+            break;
+          default:
+            setPlanningConnectionState("CLOSED");
+            break;
+        }
+      };
+
+      updateState();
+    }
+  }, [planningAgentSocket, planningAgentWsUrl]);
 
   const contextValue = useMemo(
     () => ({ connectionState, sendMessage, isLoadingHistory }),

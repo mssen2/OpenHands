@@ -1,57 +1,57 @@
 import { useTranslation } from "react-i18next";
 import React from "react";
-import { usePostHog } from "posthog-js/react";
 import { useParams, useNavigate } from "react-router";
-import { transformVSCodeUrl } from "#/utils/vscode-url-helper";
 import useMetricsStore from "#/stores/metrics-store";
-import { isSystemMessage, isActionOrObservation } from "#/types/core/guards";
-import { ConversationStatus } from "#/types/conversation-status";
-import ConversationService from "#/api/conversation-service/conversation-service.api";
 import { useDeleteConversation } from "./mutation/use-delete-conversation";
 import { useUnifiedPauseConversationSandbox } from "./mutation/use-unified-stop-conversation";
-import { useGetTrajectory } from "./mutation/use-get-trajectory";
-import { downloadTrajectory } from "#/utils/download-trajectory";
-import { displayErrorToast } from "#/utils/custom-toast-handlers";
+import { useUpdateConversationPublicFlag } from "./mutation/use-update-conversation-public-flag";
+import { displaySuccessToast } from "#/utils/custom-toast-handlers";
 import { I18nKey } from "#/i18n/declaration";
 import { useEventStore } from "#/stores/use-event-store";
-import { isV0Event } from "#/types/v1/type-guards";
+
+import { useActiveConversation } from "./query/use-active-conversation";
+import { useDownloadConversation } from "./use-download-conversation";
+import {
+  adaptSystemMessage,
+  SystemMessageForModal,
+} from "#/utils/system-message-adapter";
+import { V1SandboxStatus } from "#/api/sandbox-service/sandbox-service.types";
 
 interface UseConversationNameContextMenuProps {
   conversationId?: string;
-  conversationStatus?: ConversationStatus;
+  sandboxStatus?: V1SandboxStatus;
   showOptions?: boolean;
   onContextMenuToggle?: (isOpen: boolean) => void;
 }
 
 export function useConversationNameContextMenu({
   conversationId,
-  conversationStatus = "STOPPED",
+  sandboxStatus = "MISSING",
   showOptions = false,
   onContextMenuToggle,
 }: UseConversationNameContextMenuProps) {
-  const posthog = usePostHog();
   const { t } = useTranslation();
   const { conversationId: currentConversationId } = useParams();
   const navigate = useNavigate();
   const events = useEventStore((state) => state.events);
   const { mutate: deleteConversation } = useDeleteConversation();
   const { mutate: stopConversation } = useUnifiedPauseConversationSandbox();
-  const { mutate: getTrajectory } = useGetTrajectory();
+  const { mutate: updatePublicFlag } = useUpdateConversationPublicFlag();
+  const { data: conversation } = useActiveConversation();
   const metrics = useMetricsStore();
 
   const [metricsModalVisible, setMetricsModalVisible] = React.useState(false);
   const [systemModalVisible, setSystemModalVisible] = React.useState(false);
-  const [microagentsModalVisible, setMicroagentsModalVisible] =
-    React.useState(false);
+  const [skillsModalVisible, setSkillsModalVisible] = React.useState(false);
+  const [hooksModalVisible, setHooksModalVisible] = React.useState(false);
   const [confirmDeleteModalVisible, setConfirmDeleteModalVisible] =
     React.useState(false);
   const [confirmStopModalVisible, setConfirmStopModalVisible] =
     React.useState(false);
+  const { mutateAsync: downloadConversation } = useDownloadConversation();
 
-  const systemMessage = events
-    .filter(isV0Event)
-    .filter(isActionOrObservation)
-    .find(isSystemMessage);
+  const systemMessage: SystemMessageForModal | null =
+    adaptSystemMessage(events);
 
   const handleDelete = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
@@ -97,55 +97,14 @@ export function useConversationNameContextMenu({
     onContextMenuToggle?.(false);
   };
 
-  const handleExportConversation = (
+  const handleDownloadConversation = async (
     event: React.MouseEvent<HTMLButtonElement>,
   ) => {
     event.preventDefault();
     event.stopPropagation();
-
-    if (!conversationId) {
-      displayErrorToast(t(I18nKey.CONVERSATION$DOWNLOAD_ERROR));
-      return;
-    }
-
-    getTrajectory(conversationId, {
-      onSuccess: async (data) => {
-        await downloadTrajectory(
-          conversationId ?? t(I18nKey.CONVERSATION$UNKNOWN),
-          data.trajectory,
-        );
-      },
-      onError: () => {
-        displayErrorToast(t(I18nKey.CONVERSATION$DOWNLOAD_ERROR));
-      },
-    });
-
-    onContextMenuToggle?.(false);
-  };
-
-  const handleDownloadViaVSCode = async (
-    event: React.MouseEvent<HTMLButtonElement>,
-  ) => {
-    event.preventDefault();
-    event.stopPropagation();
-    posthog.capture("download_via_vscode_button_clicked");
-
-    // Fetch the VS Code URL from the API
     if (conversationId) {
-      try {
-        const data = await ConversationService.getVSCodeUrl(conversationId);
-        if (data.vscode_url) {
-          const transformedUrl = transformVSCodeUrl(data.vscode_url);
-          if (transformedUrl) {
-            window.open(transformedUrl, "_blank");
-          }
-        }
-        // VS Code URL not available
-      } catch {
-        // Failed to fetch VS Code URL
-      }
+      await downloadConversation(conversationId);
     }
-
     onContextMenuToggle?.(false);
   };
 
@@ -161,12 +120,51 @@ export function useConversationNameContextMenu({
     onContextMenuToggle?.(false);
   };
 
-  const handleShowMicroagents = (
-    event: React.MouseEvent<HTMLButtonElement>,
-  ) => {
+  const handleShowSkills = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
-    setMicroagentsModalVisible(true);
+    setSkillsModalVisible(true);
     onContextMenuToggle?.(false);
+  };
+
+  const handleShowHooks = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    setHooksModalVisible(true);
+    onContextMenuToggle?.(false);
+  };
+
+  const handleTogglePublic = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (conversationId && conversation) {
+      // Toggle the current public state
+      const newPublicState = !conversation.public;
+      updatePublicFlag({
+        conversationId,
+        isPublic: newPublicState,
+      });
+    }
+    // Don't close menu - let user see the toggle state change
+  };
+
+  const shareUrl = React.useMemo(() => {
+    if (conversationId) {
+      return `${window.location.origin}/shared/conversations/${conversationId}`;
+    }
+    return "";
+  }, [conversationId]);
+
+  const handleCopyShareLink = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (!shareUrl) {
+      onContextMenuToggle?.(false);
+      return;
+    }
+
+    navigator.clipboard.writeText(shareUrl);
+    displaySuccessToast(t(I18nKey.CONVERSATION$LINK_COPIED));
   };
 
   return {
@@ -174,11 +172,14 @@ export function useConversationNameContextMenu({
     handleDelete,
     handleStop,
     handleEdit,
-    handleExportConversation,
-    handleDownloadViaVSCode,
+    handleDownloadConversation,
     handleDisplayCost,
     handleShowAgentTools,
-    handleShowMicroagents,
+    handleShowSkills,
+    handleShowHooks,
+    handleTogglePublic,
+    handleCopyShareLink,
+    shareUrl,
     handleConfirmDelete,
     handleConfirmStop,
 
@@ -187,8 +188,10 @@ export function useConversationNameContextMenu({
     setMetricsModalVisible,
     systemModalVisible,
     setSystemModalVisible,
-    microagentsModalVisible,
-    setMicroagentsModalVisible,
+    skillsModalVisible,
+    setSkillsModalVisible,
+    hooksModalVisible,
+    setHooksModalVisible,
     confirmDeleteModalVisible,
     setConfirmDeleteModalVisible,
     confirmStopModalVisible,
@@ -199,11 +202,13 @@ export function useConversationNameContextMenu({
     systemMessage,
 
     // Computed values for conditional rendering
-    shouldShowStop: conversationStatus !== "STOPPED",
-    shouldShowDownload: Boolean(conversationId && showOptions),
-    shouldShowExport: Boolean(conversationId && showOptions),
+    shouldShowStop: sandboxStatus !== "MISSING",
+    shouldShowDownloadConversation: Boolean(conversationId && showOptions),
     shouldShowDisplayCost: showOptions,
     shouldShowAgentTools: Boolean(showOptions && systemMessage),
-    shouldShowMicroagents: Boolean(showOptions && conversationId),
+    shouldShowSkills: Boolean(showOptions && conversationId),
+    shouldShowHooks: Boolean(
+      showOptions && conversationId && sandboxStatus === "RUNNING",
+    ),
   };
 }

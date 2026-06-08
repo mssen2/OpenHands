@@ -2,11 +2,11 @@ import base64
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from github import Github, GithubIntegration
+from github import Auth, Github, GithubIntegration
 from integrations.github.github_view import (
     GithubIssue,
 )
@@ -19,15 +19,32 @@ from server.auth.constants import GITHUB_APP_CLIENT_ID, GITHUB_APP_PRIVATE_KEY
 from storage.openhands_pr import OpenhandsPR
 from storage.openhands_pr_store import OpenhandsPRStore
 
-from openhands.core.config import load_openhands_config
-from openhands.core.logger import openhands_logger as logger
-from openhands.integrations.github.github_service import GithubServiceImpl
-from openhands.integrations.service_types import ProviderType
-from openhands.storage import get_file_store
-from openhands.storage.locations import get_conversation_dir
+from openhands.app_server.config import get_global_config
+from openhands.app_server.conversation_paths import get_conversation_dir
+from openhands.app_server.integrations.github.github_service import GithubServiceImpl
+from openhands.app_server.integrations.service_types import ProviderType
+from openhands.app_server.utils.logger import openhands_logger as logger
 
-config = load_openhands_config()
-file_store = get_file_store(config.file_store, config.file_store_path)
+file_store = get_global_config().file_store
+
+
+def _github_ts_to_naive_utc(value: str | None) -> datetime | None:
+    """Normalize a GitHub ISO-8601 timestamp to a naive UTC datetime.
+
+    GitHub sends timestamps like ``"2025-06-19T21:19:36Z"``. Parsing the
+    trailing ``Z`` produces a timezone-aware datetime, which asyncpg refuses to
+    bind to the ``TIMESTAMP WITHOUT TIME ZONE`` columns on ``openhands_prs``
+    (``DataError: can't subtract offset-naive and offset-aware datetimes``).
+    Converting to UTC and dropping ``tzinfo`` keeps the stored value consistent
+    with how naive UTC timestamps are already persisted on that table.
+    """
+    if not value:
+        return None
+    return (
+        datetime.fromisoformat(value.replace('Z', '+00:00'))
+        .astimezone(timezone.utc)
+        .replace(tzinfo=None)
+    )
 
 
 COLLECT_GITHUB_INTERACTIONS = (
@@ -84,7 +101,7 @@ class GitHubDataCollector:
         # self.full_saved_pr_path = 'github_data/prs/{}-{}/data.json'
         self.full_saved_pr_path = 'prs/github/{}-{}/data.json'
         self.github_integration = GithubIntegration(
-            GITHUB_APP_CLIENT_ID, GITHUB_APP_PRIVATE_KEY
+            auth=Auth.AppAuth(GITHUB_APP_CLIENT_ID, GITHUB_APP_PRIVATE_KEY)
         )
         self.conversation_id = None
 
@@ -112,14 +129,12 @@ class GitHubDataCollector:
         suffix = path.format(repo_id, number)
 
         if conversation_id:
-            return f'{get_conversation_dir(conversation_id)}{suffix}'
+            return f'{get_conversation_dir(conversation_id)}/{suffix}'
 
         return suffix
 
-    def _get_installation_access_token(self, installation_id: str) -> str:
-        token_data = self.github_integration.get_access_token(
-            installation_id  # type: ignore[arg-type]
-        )
+    def _get_installation_access_token(self, installation_id: int) -> str:
+        token_data = self.github_integration.get_access_token(installation_id)
         return token_data.token
 
     def _check_openhands_author(self, name, login) -> bool:
@@ -134,7 +149,7 @@ class GitHubDataCollector:
         )
 
     def _get_issue_comments(
-        self, installation_id: str, repo_name: str, issue_number: int, conversation_id
+        self, installation_id: int, repo_name: str, issue_number: int, conversation_id
     ) -> list[dict[str, Any]]:
         """
         Retrieve all comments from an issue until a comment with conversation_id is found
@@ -143,7 +158,7 @@ class GitHubDataCollector:
         try:
             installation_token = self._get_installation_access_token(installation_id)
 
-            with Github(installation_token) as github_client:
+            with Github(auth=Auth.Token(installation_token)) as github_client:
                 repo = github_client.get_repo(repo_name)
                 issue = repo.get_issue(issue_number)
                 comments = []
@@ -234,10 +249,10 @@ class GitHubDataCollector:
             f'[Github]: Saved issue #{issue_number} for {github_view.full_repo_name}'
         )
 
-    def _get_pr_commits(self, installation_id: str, repo_name: str, pr_number: int):
+    def _get_pr_commits(self, installation_id: int, repo_name: str, pr_number: int):
         commits = []
         installation_token = self._get_installation_access_token(installation_id)
-        with Github(installation_token) as github_client:
+        with Github(auth=Auth.Token(installation_token)) as github_client:
             repo = github_client.get_repo(repo_name)
             pr = repo.get_pull(pr_number)
 
@@ -431,7 +446,12 @@ class GitHubDataCollector:
         - Num openhands review comments
         """
         pr_number = openhands_pr.pr_number
-        installation_id = openhands_pr.installation_id
+        if openhands_pr.installation_id is None:
+            logger.warning(
+                f'Skipping PR {openhands_pr.repo_name}#{pr_number}: missing installation_id'
+            )
+            return
+        installation_id = int(openhands_pr.installation_id)
         repo_id = openhands_pr.repo_id
 
         # Get installation token and create Github client
@@ -569,7 +589,7 @@ class GitHubDataCollector:
         openhands_helped_author = openhands_commit_count > 0
 
         # Update the PR with OpenHands statistics
-        update_success = store.update_pr_openhands_stats(
+        update_success = await store.update_pr_openhands_stats(
             repo_id=repo_id,
             pr_number=pr_number,
             original_updated_at=openhands_pr.updated_at,
@@ -612,7 +632,7 @@ class GitHubDataCollector:
         action = payload.get('action', '')
         return action == 'closed' and 'pull_request' in payload
 
-    def _track_closed_or_merged_pr(self, payload):
+    async def _track_closed_or_merged_pr(self, payload):
         """
         Track PR closed/merged event
         """
@@ -635,12 +655,13 @@ class GitHubDataCollector:
         num_deletions = pr_data.get('deletions', 0)
         merged = pr_data.get('merged', False)
 
-        # Extract closed_at timestamp
-        # Example: "closed_at":"2025-06-19T21:19:36Z"
-        closed_at_str = pr_data.get('closed_at')
-        created_at = pr_data.get('created_at')
-
-        closed_at = datetime.fromisoformat(closed_at_str.replace('Z', '+00:00'))
+        # Extract timestamps. Example: "closed_at":"2025-06-19T21:19:36Z".
+        # Both are normalized to naive UTC so they can be bound to the naive
+        # TIMESTAMP columns on openhands_prs (see _github_ts_to_naive_utc).
+        # Previously created_at was passed as a raw string; it is now
+        # consistently a naive-UTC datetime like closed_at.
+        closed_at = _github_ts_to_naive_utc(pr_data.get('closed_at'))
+        created_at = _github_ts_to_naive_utc(pr_data.get('created_at'))
 
         # Determine status based on whether it was merged
         status = PRStatus.MERGED if merged else PRStatus.CLOSED
@@ -671,17 +692,17 @@ class GitHubDataCollector:
             num_general_comments=num_general_comments,
         )
 
-        store.insert_pr(pr)
+        await store.insert_pr(pr)
         logger.info(f'Tracked PR {status}: {repo_id}#{pr_number}')
 
-    def process_payload(self, message: Message):
+    async def process_payload(self, message: Message):
         if not COLLECT_GITHUB_INTERACTIONS:
             return
 
         raw_payload = message.message.get('payload', {})
 
         if self._is_pr_closed_or_merged(raw_payload):
-            self._track_closed_or_merged_pr(raw_payload)
+            await self._track_closed_or_merged_pr(raw_payload)
 
     async def save_data(self, github_view: ResolverViewInterface):
         if not COLLECT_GITHUB_INTERACTIONS:

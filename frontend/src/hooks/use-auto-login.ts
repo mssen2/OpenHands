@@ -3,6 +3,7 @@ import { useConfig } from "./query/use-config";
 import { useIsAuthed } from "./query/use-is-authed";
 import { getLoginMethod, LoginMethod } from "#/utils/local-storage";
 import { useAuthUrl } from "./use-auth-url";
+import { useIsOnIntermediatePage } from "./use-is-on-intermediate-page";
 
 /**
  * Hook to automatically log in the user if they have a login method stored in local storage
@@ -11,43 +12,55 @@ import { useAuthUrl } from "./use-auth-url";
 export const useAutoLogin = () => {
   const { data: config, isLoading: isConfigLoading } = useConfig();
   const { data: isAuthed, isLoading: isAuthLoading } = useIsAuthed();
+  const isOnIntermediatePage = useIsOnIntermediatePage();
 
   // Get the stored login method
   const loginMethod = getLoginMethod();
 
   // Get the auth URLs for all providers
   const githubAuthUrl = useAuthUrl({
-    appMode: config?.APP_MODE || null,
+    appMode: config?.app_mode || null,
     identityProvider: "github",
-    authUrl: config?.AUTH_URL,
+    authUrl: config?.auth_url,
   });
 
   const gitlabAuthUrl = useAuthUrl({
-    appMode: config?.APP_MODE || null,
+    appMode: config?.app_mode || null,
     identityProvider: "gitlab",
-    authUrl: config?.AUTH_URL,
+    authUrl: config?.auth_url,
   });
 
   const bitbucketAuthUrl = useAuthUrl({
-    appMode: config?.APP_MODE || null,
+    appMode: config?.app_mode || null,
     identityProvider: "bitbucket",
-    authUrl: config?.AUTH_URL,
+    authUrl: config?.auth_url,
+  });
+
+  const bitbucketDataCenterUrl = useAuthUrl({
+    appMode: config?.app_mode || null,
+    identityProvider: "bitbucket_data_center",
+    authUrl: config?.auth_url,
   });
 
   const enterpriseSsoUrl = useAuthUrl({
-    appMode: config?.APP_MODE || null,
+    appMode: config?.app_mode || null,
     identityProvider: "enterprise_sso",
-    authUrl: config?.AUTH_URL,
+    authUrl: config?.auth_url,
   });
 
   useEffect(() => {
     // Only auto-login in SAAS mode
-    if (config?.APP_MODE !== "saas") {
+    if (config?.app_mode !== "saas") {
       return;
     }
 
     // Wait for auth and config to load
     if (isConfigLoading || isAuthLoading) {
+      return;
+    }
+
+    // Don't auto-login from intermediate steps in the auth flow
+    if (isOnIntermediatePage) {
       return;
     }
 
@@ -69,6 +82,8 @@ export const useAutoLogin = () => {
       authUrl = gitlabAuthUrl;
     } else if (loginMethod === LoginMethod.BITBUCKET) {
       authUrl = bitbucketAuthUrl;
+    } else if (loginMethod === LoginMethod.BITBUCKET_DATA_CENTER) {
+      authUrl = bitbucketDataCenterUrl;
     } else if (loginMethod === LoginMethod.ENTERPRISE_SSO) {
       authUrl = enterpriseSsoUrl;
     }
@@ -83,14 +98,16 @@ export const useAutoLogin = () => {
       window.location.href = url.toString();
     }
   }, [
-    config?.APP_MODE,
+    config?.app_mode,
     isAuthed,
     isConfigLoading,
     isAuthLoading,
+    isOnIntermediatePage,
     loginMethod,
     githubAuthUrl,
     gitlabAuthUrl,
     bitbucketAuthUrl,
+    bitbucketDataCenterUrl,
     enterpriseSsoUrl,
   ]);
 };

@@ -149,10 +149,44 @@ def test_infer_repo_from_message():
         ('https://github.com/My-User/My-Repo.git', ['My-User/My-Repo']),
         ('Check the my.user/my.repo repository', ['my.user/my.repo']),
         ('repos: user_1/repo-1 and user.2/repo_2', ['user_1/repo-1', 'user.2/repo_2']),
+        # Backtick-wrapped repo mentions (common in Slack/Discord messages)
+        (
+            '@openhands-exp just echo hello world in `OpenHands/OpenHands-CLI` repository',
+            ['OpenHands/OpenHands-CLI'],
+        ),
+        (
+            '@openhands-exp echo hello world with {{OpenHands/OpenHands-CLI}}',
+            ['OpenHands/OpenHands-CLI'],
+        ),
+        ('Deploy the `test/project` repo', ['test/project']),
+        # Colon-wrapped repo mentions
+        ('Check the :owner/repo: here', ['owner/repo']),
         # Large number of repositories
         ('Repos: a/b, c/d, e/f, g/h, i/j', ['a/b', 'c/d', 'e/f', 'g/h', 'i/j']),
         # Mixed with false positives that should be filtered
         ('Check user/repo and avoid 1.0/2.0 and file.txt', ['user/repo']),
+        # Self-hosted GitLab / GitHub Enterprise (generic host, standard layout)
+        (
+            'Deploy https://gitlab.mycorp.com/team/project.git',
+            ['team/project'],
+        ),
+        ('Repo at https://github.mycorp.com/org/service', ['org/service']),
+        # Bitbucket Data Center browse / PR URLs -> <KEY>/<slug>
+        (
+            'See https://bitbucket.mycorp.com/projects/PROJ/repos/my-repo/browse',
+            ['PROJ/my-repo'],
+        ),
+        (
+            'Fix https://bitbucket.mycorp.com/projects/PROJ/repos/my-repo/pull-requests/42',
+            ['PROJ/my-repo'],
+        ),
+        # Bitbucket Data Center clone (scm) URLs, incl. personal (~user) + port
+        (
+            'Clone https://bitbucket.mycorp.com/scm/PROJ/my-repo.git',
+            ['PROJ/my-repo'],
+        ),
+        ('https://bitbucket.mycorp.com/scm/~jdoe/tool.git', ['~jdoe/tool']),
+        ('https://git.internal:7990/scm/TEAM/app.git', ['TEAM/app']),
     ]
 
     for message, expected in test_cases:

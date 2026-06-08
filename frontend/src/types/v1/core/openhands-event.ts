@@ -1,5 +1,6 @@
 // Import all event types
 import {
+  ACPToolCallEvent,
   ActionEvent,
   MessageEvent,
   ObservationEvent,
@@ -10,7 +11,10 @@ import {
   CondensationRequestEvent,
   CondensationSummaryEvent,
   ConversationStateUpdateEvent,
+  ConversationErrorEvent,
+  HookExecutionEvent,
   PauseEvent,
+  ServerErrorEvent,
 } from "./events/index";
 
 /**
@@ -25,10 +29,16 @@ export type OpenHandsEvent =
   | UserRejectObservation
   | AgentErrorEvent
   | SystemPromptEvent
+  // ACP sub-agent tool call events
+  | ACPToolCallEvent
+  // Hook events
+  | HookExecutionEvent
   // Conversation management events
   | CondensationEvent
   | CondensationRequestEvent
   | CondensationSummaryEvent
   | ConversationStateUpdateEvent
+  | ConversationErrorEvent
   // Control events
-  | PauseEvent;
+  | PauseEvent
+  | ServerErrorEvent;

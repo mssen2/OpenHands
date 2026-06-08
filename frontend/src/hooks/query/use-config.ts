@@ -1,15 +1,19 @@
 import { useQuery } from "@tanstack/react-query";
 import OptionService from "#/api/option-service/option-service.api";
-import { useIsOnTosPage } from "#/hooks/use-is-on-tos-page";
+import { useIsOnIntermediatePage } from "#/hooks/use-is-on-intermediate-page";
+import { QUERY_KEYS, CONFIG_CACHE_OPTIONS } from "./query-keys";
 
-export const useConfig = () => {
-  const isOnTosPage = useIsOnTosPage();
+interface UseConfigOptions {
+  enabled?: boolean;
+}
+
+export const useConfig = (options?: UseConfigOptions) => {
+  const isOnIntermediatePage = useIsOnIntermediatePage();
 
   return useQuery({
-    queryKey: ["config"],
+    queryKey: QUERY_KEYS.WEB_CLIENT_CONFIG,
     queryFn: OptionService.getConfig,
-    staleTime: 1000 * 60 * 5, // 5 minutes
-    gcTime: 1000 * 60 * 15, // 15 minutes,
-    enabled: !isOnTosPage,
+    ...CONFIG_CACHE_OPTIONS,
+    enabled: options?.enabled ?? !isOnIntermediatePage,
   });
 };

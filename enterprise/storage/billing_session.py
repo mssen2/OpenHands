@@ -1,10 +1,17 @@
 from datetime import UTC, datetime
+from decimal import Decimal
+from typing import TYPE_CHECKING
+from uuid import UUID
 
-from sqlalchemy import DECIMAL, Column, DateTime, Enum, String
+from sqlalchemy import DECIMAL, DateTime, Enum, ForeignKey, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 from storage.base import Base
 
+if TYPE_CHECKING:
+    from storage.org import Org
 
-class BillingSession(Base):  # type: ignore
+
+class BillingSession(Base):
     """
     Represents a Stripe billing session for credit purchases.
     Tracks the status of payment transactions and associated user information.
@@ -12,9 +19,10 @@ class BillingSession(Base):  # type: ignore
 
     __tablename__ = 'billing_sessions'
 
-    id = Column(String, primary_key=True)
-    user_id = Column(String, nullable=False)
-    status = Column(
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, nullable=False)
+    org_id: Mapped[UUID | None] = mapped_column(ForeignKey('org.id'), nullable=True)
+    status: Mapped[str] = mapped_column(
         Enum(
             'in_progress',
             'completed',
@@ -24,22 +32,16 @@ class BillingSession(Base):  # type: ignore
         ),
         default='in_progress',
     )
-    billing_session_type = Column(
-        Enum(
-            'DIRECT_PAYMENT',
-            'MONTHLY_SUBSCRIPTION',
-            name='billing_session_type_enum',
-        ),
-        nullable=False,
-        default='DIRECT_PAYMENT',
-    )
-    price = Column(DECIMAL(19, 4), nullable=False)
-    price_code = Column(String, nullable=False)
-    created_at = Column(
+    price: Mapped[Decimal] = mapped_column(DECIMAL(19, 4), nullable=False)
+    price_code: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),  # type: ignore[attr-defined]
+        default=lambda: datetime.now(UTC),
     )
-    updated_at = Column(
+    updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),  # type: ignore[attr-defined]
+        default=lambda: datetime.now(UTC),
     )
+
+    # Relationships
+    org: Mapped['Org | None'] = relationship('Org', back_populates='billing_sessions')

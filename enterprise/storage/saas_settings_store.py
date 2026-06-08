@@ -1,54 +1,97 @@
 from __future__ import annotations
 
-import binascii
-import hashlib
-import json
-import os
-from base64 import b64decode, b64encode
+import uuid
 from dataclasses import dataclass
+from typing import Any
+from uuid import UUID
 
-import httpx
-from cryptography.fernet import Fernet
-from integrations import stripe_service
 from pydantic import SecretStr
 from server.auth.token_manager import TokenManager
-from server.constants import (
-    CURRENT_USER_SETTINGS_VERSION,
-    DEFAULT_INITIAL_BUDGET,
-    LITE_LLM_API_KEY,
-    LITE_LLM_API_URL,
-    LITE_LLM_TEAM_ID,
-    REQUIRE_PAYMENT,
-    get_default_litellm_model,
-)
+from server.constants import LITE_LLM_API_URL
 from server.logger import logger
-from sqlalchemy.orm import sessionmaker
-from storage.database import session_maker
+from server.routes.org_models import OrgMemberSettingsUpdate
+from sqlalchemy import select
+from sqlalchemy.orm import joinedload
+from storage.database import a_session_maker
+from storage.lite_llm_manager import LiteLlmManager, get_openhands_cloud_key_alias
+from storage.org import Org
+from storage.org_member import OrgMember
+from storage.org_member_store import OrgMemberStore
+from storage.org_store import OrgStore
+from storage.user import User
 from storage.user_settings import UserSettings
+from storage.user_store import UserStore
 
-from openhands.core.config.openhands_config import OpenHandsConfig
-from openhands.server.settings import Settings
-from openhands.storage import get_file_store
-from openhands.storage.settings.settings_store import SettingsStore
-from openhands.utils.async_utils import call_sync_from_async
-from openhands.utils.http_session import httpx_verify_option
+from openhands.app_server.settings.llm_profiles import LLMProfiles
+from openhands.app_server.settings.settings_models import Settings
+from openhands.app_server.settings.settings_store import SettingsStore
+from openhands.app_server.utils.jsonpatch_compat import (
+    WHOLESALE_REPLACEMENT_KEYS,
+    deep_merge,
+    deep_merge_with_wholesale_keys,
+)
+from openhands.app_server.utils.llm import is_openhands_model
+
+# Agent-settings keys that are private to each org member and must never
+# be written to org-level defaults or broadcast across the org. Today this
+# covers ``mcp_config`` (per-user MCP server set) and ``acp_env`` (per-user
+# ACP environment variables) — both are dict-of-items collections that
+# represent one member's personal configuration, not org-wide defaults.
+MEMBER_PRIVATE_AGENT_KEYS: frozenset[str] = WHOLESALE_REPLACEMENT_KEYS
+
+
+def _split_member_private_keys(
+    agent_settings_diff: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split an agent_settings dump into (shared, private) halves.
+
+    The shared half is safe to write to ``org.agent_settings`` and to
+    broadcast through ``update_all_members_settings_async``. The private
+    half must be applied only to the acting member's row.
+    """
+    private = {
+        key: agent_settings_diff[key]
+        for key in MEMBER_PRIVATE_AGENT_KEYS
+        if key in agent_settings_diff
+    }
+    shared = {
+        key: value
+        for key, value in agent_settings_diff.items()
+        if key not in MEMBER_PRIVATE_AGENT_KEYS
+    }
+    return shared, private
 
 
 @dataclass
 class SaasSettingsStore(SettingsStore):
     user_id: str
-    session_maker: sessionmaker
-    config: OpenHandsConfig
+    # When set, overrides the user's `current_org_id` for both `load()` and
+    # `store()`. Used to honor a request's effective org (api_key_org_id >
+    # X-Org-Id header > user.current_org_id) so an API key minted for org A
+    # used by a user whose `current_org_id` later switched to B still
+    # reads/writes settings under org A.
+    effective_org_id: UUID | None = None
 
-    def get_user_settings_by_keycloak_id(
+    def _resolve_org_id(self, user: User) -> UUID:
+        """Return the effective org id for this request, or the user's
+        current org id as a fallback. The caller still needs to verify
+        that the user is a member of the returned org (handled in load/
+        store by the existing org_members lookup).
+
+        `user.current_org_id` is non-nullable on the ORM model, so the
+        result is always a UUID.
+        """
+        return self.effective_org_id or user.current_org_id
+
+    async def _get_user_settings_by_keycloak_id_async(
         self, keycloak_user_id: str, session=None
     ) -> UserSettings | None:
         """
-        Get UserSettings by keycloak_user_id.
+        Get UserSettings by keycloak_user_id (async version).
 
         Args:
             keycloak_user_id: The keycloak user ID to search for
-            session: Optional existing database session. If not provided, creates a new one.
+            session: Optional existing async database session. If not provided, creates a new one.
 
         Returns:
             UserSettings object if found, None otherwise
@@ -56,337 +99,420 @@ class SaasSettingsStore(SettingsStore):
         if not keycloak_user_id:
             return None
 
-        def _get_settings():
-            if session:
-                # Use provided session
-                return (
-                    session.query(UserSettings)
-                    .filter(UserSettings.keycloak_user_id == keycloak_user_id)
-                    .first()
+        if session:
+            # Use provided session
+            result = await session.execute(
+                select(UserSettings).filter(
+                    UserSettings.keycloak_user_id == keycloak_user_id
                 )
-            else:
-                # Create new session
-                with self.session_maker() as new_session:
-                    return (
-                        new_session.query(UserSettings)
-                        .filter(UserSettings.keycloak_user_id == keycloak_user_id)
-                        .first()
+            )
+            return result.scalars().first()
+        else:
+            # Create new session
+            async with a_session_maker() as new_session:
+                result = await new_session.execute(
+                    select(UserSettings).filter(
+                        UserSettings.keycloak_user_id == keycloak_user_id
                     )
+                )
+                return result.scalars().first()
 
-        return _get_settings()
+    @staticmethod
+    def _get_effective_llm_api_key(
+        org: Org,
+        org_member: OrgMember,
+    ) -> SecretStr | None:
+        if org_member.has_custom_llm_api_key:
+            return org_member.llm_api_key
+        return org.llm_api_key or org_member.llm_api_key
+
+    @staticmethod
+    def _get_persisted_agent_settings(item: Settings) -> dict[str, Any]:
+        return item.agent_settings.model_dump(mode='json')
 
     async def load(self) -> Settings | None:
-        if not self.user_id:
+        user = await UserStore.get_user_by_id(self.user_id)
+        if not user:
+            logger.error(f'User not found for ID {self.user_id}')
             return None
-        with self.session_maker() as session:
-            settings = self.get_user_settings_by_keycloak_id(self.user_id, session)
 
-            if not settings or settings.user_version != CURRENT_USER_SETTINGS_VERSION:
-                logger.info(
-                    'saas_settings_store:load:triggering_migration',
-                    extra={'user_id': self.user_id},
+        org_id = self._resolve_org_id(user)
+        org_member: OrgMember | None = None
+        for om in user.org_members:
+            if om.org_id == org_id:
+                org_member = om
+                break
+        if not org_member:
+            return None
+        org = await OrgStore.get_org_by_id_async(org_id)
+        if not org:
+            logger.error(
+                f'Org not found for ID {org_id} as the current org for user {self.user_id}'
+            )
+            return None
+        org_agent_settings = OrgStore.get_agent_settings_from_org(org)
+        member_agent_settings_diff = dict(org_member.agent_settings_diff)
+
+        kwargs = {
+            **{
+                normalized: getattr(org, c.name)
+                for c in Org.__table__.columns
+                if (
+                    normalized := c.name.removeprefix('_default_')
+                    .removeprefix('default_')
+                    .lstrip('_')
                 )
-                return await self.create_default_settings(settings)
-            kwargs = {
-                c.name: getattr(settings, c.name)
-                for c in UserSettings.__table__.columns
-                if c.name in Settings.model_fields
-            }
-            self._decrypt_kwargs(kwargs)
-            settings = Settings(**kwargs)
-            return settings
+                in Settings.model_fields
+            },
+            **{
+                normalized: getattr(user, c.name)
+                for c in User.__table__.columns
+                if (normalized := c.name.lstrip('_')) in Settings.model_fields
+            },
+        }
+        # Drop member-private keys from the org dump before merging so
+        # legacy values written by older code paths (when mcp_config /
+        # acp_env were broadcast at the org level) can no longer leak
+        # one member's private config to another. Each member's own
+        # ``agent_settings_diff`` still supplies their personal values.
+        org_agent_settings_dump = org_agent_settings.model_dump(mode='json')
+        for private_key in MEMBER_PRIVATE_AGENT_KEYS:
+            org_agent_settings_dump.pop(private_key, None)
+        merged_agent_settings = deep_merge(
+            org_agent_settings_dump,
+            member_agent_settings_diff,
+        )
+        effective_llm_api_key = self._get_effective_llm_api_key(org, org_member)
+        if effective_llm_api_key is not None:
+            merged_agent_settings.setdefault('llm', {})['api_key'] = (
+                effective_llm_api_key.get_secret_value()
+                if isinstance(effective_llm_api_key, SecretStr)
+                else effective_llm_api_key
+            )
+        else:
+            logger.warning(
+                f'No effective LLM API key found for user {self.user_id} '
+                f'in org {org_id} (org key and member key are both unset)'
+            )
+        kwargs['agent_settings'] = merged_agent_settings
+        org_conversation = OrgStore.get_conversation_settings_from_org(org)
+        member_conversation_diff = dict(org_member.conversation_settings_diff)
+        kwargs['conversation_settings'] = deep_merge(
+            org_conversation.model_dump(mode='json'),
+            member_conversation_diff,
+        )
+        if org.v1_enabled is None:
+            kwargs['v1_enabled'] = True
+        # Apply default if sandbox_grouping_strategy is None in the database
+        if kwargs.get('sandbox_grouping_strategy') is None:
+            kwargs.pop('sandbox_grouping_strategy', None)
+        # Profiles in SaaS live on the org (managed via
+        # /api/organizations/{org_id}/profiles). Surface them through
+        # Settings.llm_profiles so the chat-layer endpoints
+        # (/api/v1/settings/profiles and /switch_profile) see them without
+        # needing a separate code path. Falls back to user.llm_profiles when
+        # the org has none — handles older personal accounts whose profiles
+        # never moved to the org column.
+        if org.llm_profiles:
+            kwargs['llm_profiles'] = org.llm_profiles
+        # When no profiles exist yet, seed a Default profile from the legacy
+        # LLM config so users (and orgs) upgrading from pre-llm_profiles
+        # settings keep their previous LLM as the active profile instead of
+        # landing on an empty profiles UI (mirrors the OSS FileSettingsStore).
+        # Covers both pre-migration rows (llm_profiles is None) and
+        # already-migrated orgs whose profiles map is empty.
+        seeded_default = False
+        if not (kwargs.get('llm_profiles') or {}).get('profiles'):
+            legacy_llm = merged_agent_settings.get('llm')
+            if isinstance(legacy_llm, dict) and legacy_llm.get('model'):
+                kwargs['llm_profiles'] = {
+                    'profiles': {'Default': dict(legacy_llm)},
+                    'active': 'Default',
+                }
+                seeded_default = True
+            else:
+                # No legacy LLM to seed; drop a None value so the non-nullable
+                # Settings.llm_profiles falls back to its default_factory.
+                kwargs.pop('llm_profiles', None)
+
+        settings = Settings(**kwargs)
+
+        # The seed above is in-memory only. Persist it onto the org row so the
+        # legacy LLM becomes a real stored profile — otherwise the profiles
+        # management API (server/routes/org_profiles.py, which reads
+        # org.llm_profiles directly) would still see an empty list and the
+        # user's previous model would never land "inside the profiles".
+        # Persist is best-effort: a transient DB failure here must not block
+        # returning settings the caller already has in memory.
+        if seeded_default:
+            try:
+                await self._persist_seeded_default_profile(
+                    org_id, settings.llm_profiles
+                )
+            except Exception:
+                logger.warning(
+                    'Failed to persist seeded Default profile for org %s',
+                    org_id,
+                    exc_info=True,
+                )
+
+        return settings
+
+    async def _persist_seeded_default_profile(
+        self, org_id: UUID, llm_profiles: LLMProfiles
+    ) -> None:
+        """Backfill the seeded ``Default`` profile onto ``org.llm_profiles``.
+
+        Runs once per org during the pre-llm_profiles → llm_profiles upgrade:
+        ``load()`` seeds the profile in memory, and this writes it back so it
+        becomes a real stored profile that the org-profiles management API can
+        list and mutate. Re-checks emptiness under a row lock so a concurrent
+        ``load()`` doesn't double-seed and so a profile a member just created
+        through the management API is never clobbered.
+        """
+        serialized = llm_profiles.model_dump(
+            mode='json', context={'expose_secrets': True}
+        )
+        async with a_session_maker() as session:
+            result = await session.execute(
+                select(Org).filter(Org.id == org_id).with_for_update()
+            )
+            org = result.scalars().first()
+            if org is None:
+                return
+            # Only seed while the column is still empty — another request may
+            # have populated it between this load() and acquiring the lock.
+            if (org.llm_profiles or {}).get('profiles'):
+                return
+            org.llm_profiles = serialized
+            await session.commit()
 
     async def store(self, item: Settings):
-        with self.session_maker() as session:
-            existing = None
-            kwargs = {}
-            if item:
-                kwargs = item.model_dump(context={'expose_secrets': True})
-                self._encrypt_kwargs(kwargs)
-                # First check if we have an existing entry in the new table
-                existing = self.get_user_settings_by_keycloak_id(self.user_id, session)
-
-            kwargs = {
-                key: value
-                for key, value in kwargs.items()
-                if key in UserSettings.__table__.columns
-            }
-            if existing:
-                # Update existing entry
-                for key, value in kwargs.items():
-                    setattr(existing, key, value)
-                existing.user_version = CURRENT_USER_SETTINGS_VERSION
-                session.merge(existing)
-            else:
-                kwargs['keycloak_user_id'] = self.user_id
-                kwargs['user_version'] = CURRENT_USER_SETTINGS_VERSION
-                kwargs.pop('secrets_store', None)  # Don't save secrets_store to db
-                settings = UserSettings(**kwargs)
-                session.add(settings)
-            session.commit()
-
-    async def create_default_settings(self, user_settings: UserSettings | None):
-        logger.info(
-            'saas_settings_store:create_default_settings:start',
-            extra={'user_id': self.user_id},
-        )
-        # You must log in before you get default settings
-        if not self.user_id:
-            return None
-
-        # Only users that have specified a payment method get default settings
-        if REQUIRE_PAYMENT and not await stripe_service.has_payment_method(
-            self.user_id
-        ):
-            logger.info(
-                'saas_settings_store:create_default_settings:no_payment',
-                extra={'user_id': self.user_id},
+        async with a_session_maker() as session:
+            if not item:
+                return None
+            result = await session.execute(
+                select(User)
+                .options(joinedload(User.org_members))
+                .filter(User.id == uuid.UUID(self.user_id))
             )
-            return None
-        settings: Settings | None = None
-        if user_settings is None:
-            settings = Settings(
-                language='en',
-                enable_proactive_conversation_starters=True,
-            )
-        elif isinstance(user_settings, UserSettings):
-            # Convert UserSettings (SQLAlchemy model) to Settings (Pydantic model)
-            kwargs = {
-                c.name: getattr(user_settings, c.name)
-                for c in UserSettings.__table__.columns
-                if c.name in Settings.model_fields
-            }
-            self._decrypt_kwargs(kwargs)
-            settings = Settings(**kwargs)
+            user = result.scalars().first()
 
-        if settings:
-            settings = await self.update_settings_with_litellm_default(settings)
-        if settings is None:
-            logger.info(
-                'saas_settings_store:create_default_settings:litellm_update_failed',
-                extra={'user_id': self.user_id},
-            )
-            return None
-
-        await self.store(settings)
-        return settings
-
-    async def load_legacy_file_store_settings(self, github_user_id: str):
-        if not github_user_id:
-            return None
-
-        file_store = get_file_store(self.config.file_store, self.config.file_store_path)
-        path = f'users/github/{github_user_id}/settings.json'
-
-        try:
-            json_str = await call_sync_from_async(file_store.read, path)
-            logger.info(
-                'saas_settings_store:load_legacy_file_store_settings:found',
-                extra={'github_user_id': github_user_id},
-            )
-            kwargs = json.loads(json_str)
-            self._decrypt_kwargs(kwargs)
-            settings = Settings(**kwargs)
-            return settings
-        except FileNotFoundError:
-            return None
-        except Exception as e:
-            logger.error(
-                'saas_settings_store:load_legacy_file_store_settings:error',
-                extra={'github_user_id': github_user_id, 'error': str(e)},
-            )
-            return None
-
-    async def update_settings_with_litellm_default(
-        self, settings: Settings
-    ) -> Settings | None:
-        logger.info(
-            'saas_settings_store:update_settings_with_litellm_default:start',
-            extra={'user_id': self.user_id},
-        )
-        if LITE_LLM_API_KEY is None or LITE_LLM_API_URL is None:
-            return None
-        local_deploy = os.environ.get('LOCAL_DEPLOYMENT', None)
-        key = LITE_LLM_API_KEY
-        if not local_deploy:
-            # Get user info to add to litellm
-            token_manager = TokenManager()
-            keycloak_user_info = (
-                await token_manager.get_user_info_from_user_id(self.user_id) or {}
-            )
-
-            async with httpx.AsyncClient(
-                verify=httpx_verify_option(),
-                headers={
-                    'x-goog-api-key': LITE_LLM_API_KEY,
-                },
-            ) as client:
-                # Get the previous max budget to prevent accidental loss
-                # In Litellm a get always succeeds, regardless of whether the user actually exists
-                response = await client.get(
-                    f'{LITE_LLM_API_URL}/user/info?user_id={self.user_id}'
-                )
-                response.raise_for_status()
-                response_json = response.json()
-                user_info = response_json.get('user_info') or {}
-                logger.info(
-                    f'creating_litellm_user: {self.user_id}; prev_max_budget: {user_info.get("max_budget")}; prev_metadata: {user_info.get("metadata")}'
-                )
-                max_budget = user_info.get('max_budget') or DEFAULT_INITIAL_BUDGET
-                spend = user_info.get('spend') or 0
-
-                with session_maker() as session:
-                    user_settings = self.get_user_settings_by_keycloak_id(
-                        self.user_id, session
+            if not user:
+                # Check if we need to migrate from user_settings
+                user_settings = None
+                async with a_session_maker() as new_session:
+                    user_settings = await self._get_user_settings_by_keycloak_id_async(
+                        self.user_id, new_session
                     )
-                    # In upgrade to V4, we no longer use billing margin, but instead apply this directly
-                    # in litellm. The default billing marign was 2 before this (hence the magic numbers below)
-                    if (
-                        user_settings
-                        and user_settings.user_version < 4
-                        and user_settings.billing_margin
-                        and user_settings.billing_margin != 1.0
-                    ):
-                        billing_margin = user_settings.billing_margin
-                        logger.info(
-                            'user_settings_v4_budget_upgrade',
-                            extra={
-                                'max_budget': max_budget,
-                                'billing_margin': billing_margin,
-                                'spend': spend,
-                            },
-                        )
-                        max_budget *= billing_margin
-                        spend *= billing_margin
-                        user_settings.billing_margin = 1.0
-                        session.commit()
-
-                email = keycloak_user_info.get('email')
-
-                # We explicitly delete here to guard against odd inherited settings on upgrade.
-                # We don't care if this fails with a 404
-                await client.post(
-                    f'{LITE_LLM_API_URL}/user/delete', json={'user_ids': [self.user_id]}
-                )
-
-                # Create the new litellm user
-                response = await self._create_user_in_lite_llm(
-                    client, email, max_budget, spend
-                )
-                if not response.is_success:
-                    logger.warning(
-                        'duplicate_user_email',
-                        extra={'user_id': self.user_id, 'email': email},
+                if user_settings:
+                    token_manager = TokenManager()
+                    user_info = await token_manager.get_user_info_from_user_id(
+                        self.user_id
                     )
-                    # Litellm insists on unique email addresses - it is possible the email address was registered with a different user.
-                    response = await self._create_user_in_lite_llm(
-                        client, None, max_budget, spend
+                    if not user_info:
+                        logger.error(f'User info not found for ID {self.user_id}')
+                        return None
+                    user = await UserStore.migrate_user(
+                        self.user_id, user_settings, user_info
                     )
-
-                # User failed to create in litellm - this is an unforseen error state...
-                if not response.is_success:
-                    logger.error(
-                        'error_creating_litellm_user',
-                        extra={
-                            'status_code': response.status_code,
-                            'text': response.text,
-                            'user_id': [self.user_id],
-                            'email': email,
-                            'max_budget': max_budget,
-                            'spend': spend,
-                        },
-                    )
+                    if not user:
+                        logger.error(f'Failed to migrate user {self.user_id}')
+                        return None
+                else:
+                    logger.error(f'User not found for ID {self.user_id}')
                     return None
 
-                response_json = response.json()
-                key = response_json['key']
+            org_id = self._resolve_org_id(user)
 
-                logger.info(
-                    'saas_settings_store:update_settings_with_litellm_default:user_created',
-                    extra={'user_id': self.user_id},
+            org_member: OrgMember | None = None
+            for om in user.org_members:
+                if om.org_id == org_id:
+                    org_member = om
+                    break
+            if not org_member:
+                return None
+
+            result = await session.execute(select(Org).filter(Org.id == org_id))
+            org = result.scalars().first()
+            if not org:
+                logger.error(
+                    f'Org not found for ID {org_id} as the current org for user {self.user_id}'
+                )
+                return None
+
+            llm_model = item.agent_settings.llm.model
+            llm_base_url = item.agent_settings.llm.base_url
+            normalized_llm_base_url = llm_base_url.rstrip('/') if llm_base_url else None
+            normalized_managed_base_url = LITE_LLM_API_URL.rstrip('/')
+            uses_managed_llm_key = (
+                normalized_llm_base_url == normalized_managed_base_url
+                or (normalized_llm_base_url is None and is_openhands_model(llm_model))
+            )
+
+            if uses_managed_llm_key:
+                await self._ensure_api_key(
+                    item, str(org_id), openhands_type=is_openhands_model(llm_model)
                 )
 
-        settings.agent = 'CodeActAgent'
-        # Use the model corresponding to the current user settings version
-        settings.llm_model = get_default_litellm_model()
-        settings.llm_api_key = SecretStr(key)
-        settings.llm_base_url = LITE_LLM_API_URL
-        return settings
+            effective_agent_settings_diff = self._get_persisted_agent_settings(item)
+
+            # Keep mcp_config / acp_env scoped to the acting member only.
+            # ``shared_agent_settings_diff`` is the slice safe for org-wide
+            # state; ``private_agent_settings_diff`` is applied below to the
+            # acting member's row only so other members don't inherit one
+            # user's MCP servers (or ACP env vars).
+            shared_agent_settings_diff, private_agent_settings_diff = (
+                _split_member_private_keys(effective_agent_settings_diff)
+            )
+
+            # Strip any pre-existing private keys from the org dump before
+            # merging, so legacy values written by older code paths are
+            # cleaned up on the next save and stop leaking to other members.
+            org_agent_settings_dump = OrgStore.get_agent_settings_from_org(
+                org
+            ).model_dump(mode='json')
+            for private_key in MEMBER_PRIVATE_AGENT_KEYS:
+                org_agent_settings_dump.pop(private_key, None)
+
+            # Single assignment so SQLAlchemy tracks the change
+            org.agent_settings = deep_merge_with_wholesale_keys(
+                org_agent_settings_dump,
+                shared_agent_settings_diff,
+            )
+
+            effective_conversation_diff = item.conversation_settings.model_dump(
+                mode='json'
+            )
+            org.conversation_settings = deep_merge(
+                OrgStore.get_conversation_settings_from_org(org).model_dump(
+                    mode='json'
+                ),
+                effective_conversation_diff,
+            )
+
+            kwargs = item.model_dump(context={'expose_secrets': True})
+            kwargs.pop('agent_settings', None)
+            kwargs.pop('conversation_settings', None)
+
+            for key, value in kwargs.items():
+                if hasattr(user, key):
+                    setattr(user, key, value)
+                if hasattr(org, key) and key not in {
+                    'llm_api_key',
+                    'agent_settings',
+                    'conversation_settings',
+                }:
+                    setattr(org, key, value)
+
+            current_member_llm_api_key = item.agent_settings.llm.api_key
+            org_default_llm_api_key = org.llm_api_key
+            org_default_llm_api_key_raw = (
+                org_default_llm_api_key.get_secret_value()
+                if org_default_llm_api_key
+                else None
+            )
+            current_member_llm_api_key_raw = (
+                current_member_llm_api_key.get_secret_value()  # type: ignore[union-attr]
+                if current_member_llm_api_key
+                else None
+            )
+
+            await OrgMemberStore.update_all_members_settings_async(
+                session,
+                org_id,
+                OrgMemberSettingsUpdate(
+                    agent_settings_diff=shared_agent_settings_diff,
+                    conversation_settings_diff=effective_conversation_diff,
+                    llm_api_key=(
+                        current_member_llm_api_key_raw  # type: ignore[arg-type]
+                        if not uses_managed_llm_key
+                        else None
+                    ),
+                ),
+            )
+
+            # Member-private keys (mcp_config, acp_env) live only on the
+            # acting member's row. Use the wholesale-replacement semantics
+            # so deletes stick (APP-1862).
+            if private_agent_settings_diff:
+                org_member.agent_settings_diff = deep_merge_with_wholesale_keys(
+                    dict(org_member.agent_settings_diff),
+                    private_agent_settings_diff,
+                )
+
+            if uses_managed_llm_key and current_member_llm_api_key is not None:
+                # Managed/proxy key — store on this member but mark as org-managed
+                org_member.llm_api_key = current_member_llm_api_key  # type: ignore[assignment]
+                org_member.has_custom_llm_api_key = False
+            elif current_member_llm_api_key_raw is not None:
+                # BYOR: member supplied their own (non-managed) API key
+                org_member.llm_api_key = current_member_llm_api_key  # type: ignore[assignment]
+                org_member.has_custom_llm_api_key = True
+            elif org_default_llm_api_key_raw is not None:
+                # No member key, falling back to org default
+                org_member.has_custom_llm_api_key = False
+
+            await session.commit()
 
     @classmethod
-    async def get_instance(
+    async def get_instance(  # type: ignore[override]
         cls,
-        config: OpenHandsConfig,
-        user_id: str,  # type: ignore[override]
+        user_id: str,
+        effective_org_id: UUID | None = None,
     ) -> SaasSettingsStore:
+        """Get a SaasSettingsStore instance for the given user.
+
+        Args:
+            user_id: Keycloak user id.
+            effective_org_id: Optional org id resolved from the request
+                (see SaasUserAuth.get_effective_org_id). When None the
+                store falls back to ``user.current_org_id`` to preserve
+                legacy behavior for background / non-request callers.
+
+        TODO: This method should be replaced with dependency injection.
+        """
         logger.debug(f'saas_settings_store.get_instance::{user_id}')
-        return SaasSettingsStore(user_id, session_maker, config)
+        return SaasSettingsStore(user_id, effective_org_id=effective_org_id)
 
-    def _decrypt_kwargs(self, kwargs: dict):
-        fernet = self._fernet()
-        for key, value in kwargs.items():
-            try:
-                if value is None:
-                    continue
-                if self._should_encrypt(key):
-                    if isinstance(value, SecretStr):
-                        value = fernet.decrypt(
-                            b64decode(value.get_secret_value().encode())
-                        ).decode()
-                    else:
-                        value = fernet.decrypt(b64decode(value.encode())).decode()
-                    kwargs[key] = value
-            except binascii.Error:
-                pass  # Key is in legacy format...
+    async def _ensure_api_key(
+        self, item: Settings, org_id: str, openhands_type: bool = False
+    ) -> None:
+        """Generate and set the OpenHands API key for the given settings.
 
-    def _encrypt_kwargs(self, kwargs: dict):
-        fernet = self._fernet()
-        for key, value in kwargs.items():
-            if value is None:
-                continue
+        First checks if an existing key exists for the user and verifies it
+        is valid in LiteLLM. If valid, reuses it. Otherwise, generates a new key.
+        """
 
-            if isinstance(value, dict):
-                self._encrypt_kwargs(value)
-                continue
+        llm_api_key = item.agent_settings.llm.api_key
 
-            if self._should_encrypt(key):
-                if isinstance(value, SecretStr):
-                    value = b64encode(
-                        fernet.encrypt(value.get_secret_value().encode())
-                    ).decode()
-                else:
-                    value = b64encode(fernet.encrypt(value.encode())).decode()
-                kwargs[key] = value
+        # First, check if our current key is valid
+        if llm_api_key and not await LiteLlmManager.verify_existing_key(
+            llm_api_key.get_secret_value(),  # type: ignore[union-attr]
+            self.user_id,
+            org_id,
+            openhands_type=openhands_type,
+        ):
+            if openhands_type:
+                generated_key = await LiteLlmManager.generate_key(
+                    self.user_id,
+                    org_id,
+                    None,
+                    {'type': 'openhands'},
+                )
+            else:
+                # Must delete any existing key with the same alias first
+                key_alias = get_openhands_cloud_key_alias(self.user_id, org_id)
+                await LiteLlmManager.delete_key_by_alias(key_alias=key_alias)
+                generated_key = await LiteLlmManager.generate_key(
+                    self.user_id,
+                    org_id,
+                    key_alias,
+                    None,
+                )
 
-    def _fernet(self):
-        if not self.config.jwt_secret:
-            raise ValueError('jwt_secret must be defined on config')
-        jwt_secret = self.config.jwt_secret.get_secret_value()
-        fernet_key = b64encode(hashlib.sha256(jwt_secret.encode()).digest())
-        return Fernet(fernet_key)
-
-    def _should_encrypt(self, key: str) -> bool:
-        return key in ('llm_api_key', 'llm_api_key_for_byor', 'search_api_key')
-
-    async def _create_user_in_lite_llm(
-        self, client: httpx.AsyncClient, email: str | None, max_budget: int, spend: int
-    ):
-        response = await client.post(
-            f'{LITE_LLM_API_URL}/user/new',
-            json={
-                'user_email': email,
-                'models': [],
-                'max_budget': max_budget,
-                'spend': spend,
-                'user_id': str(self.user_id),
-                'teams': [LITE_LLM_TEAM_ID],
-                'auto_create_key': True,
-                'send_invite_email': False,
-                'metadata': {
-                    'version': CURRENT_USER_SETTINGS_VERSION,
-                    'model': get_default_litellm_model(),
-                },
-                'key_alias': f'OpenHands Cloud - user {self.user_id}',
-            },
-        )
-        return response
+            item.agent_settings.llm.api_key = SecretStr(generated_key)
+            logger.info(
+                'saas_settings_store:store:generated_openhands_key',
+                extra={'user_id': self.user_id},
+            )

@@ -2,7 +2,7 @@
 
 You have a few options here, which are expanded on below:
 
-- A simple local development setup, with live reloading for both OSS and this repo
+- A simple local development setup, with live reloading for both OpenHands and this repo
 - A more complex setup that includes Redis
 - An even more complex setup that includes GitHub events
 
@@ -26,7 +26,7 @@ Before starting, make sure you have the following tools installed:
 
 ## Option 1: Simple local development
 
-This option will allow you to modify the both the OSS code and the code in this repo,
+This option will allow you to modify both the OpenHands code and the code in this repo,
 and see the changes in real-time.
 
 This option works best for most scenarios. The only thing it's missing is
@@ -50,7 +50,7 @@ First run this to retrieve Github App secrets
 ```
 gcloud auth application-default login
 gcloud config set project global-432717
-local/decrypt_env.sh
+enterprise_local/decrypt_env.sh /path/to/root/of/deploy/repo
 ```
 
 Now run this to generate a `.env` file, which will used to run SAAS locally
@@ -59,13 +59,6 @@ Now run this to generate a `.env` file, which will used to run SAAS locally
 python -m pip install PyYAML
 export LITE_LLM_API_KEY=<your LLM API key>
 python enterprise_local/convert_to_env.py
-```
-
-You'll also need to set up the runtime image, so that the dev server doesn't try to rebuild it.
-
-```
-export SANDBOX_RUNTIME_CONTAINER_IMAGE=ghcr.io/openhands/runtime:main-nikolaik
-docker pull $SANDBOX_RUNTIME_CONTAINER_IMAGE
 ```
 
 By default the application will log in json, you can override.
@@ -105,9 +98,9 @@ export REDIS_PORT=6379
 
 (see above)
 
-### 2. Build OSS Openhands
+### 2. Build OpenHands
 
-Develop on [Openhands](https://github.com/All-Hands-AI/OpenHands) locally. When ready, run the following inside Openhands repo (not the Deploy repo)
+Develop on [Openhands](https://github.com/OpenHands/OpenHands) locally. When ready, run the following inside Openhands repo (not the Deploy repo)
 
 ```
 docker build -f containers/app/Dockerfile -t openhands .
@@ -155,7 +148,7 @@ Visit the tunnel domain found in Step 4 to run the app (`https://bc71-2603-7000-
 
 ### Local Debugging with VSCode
 
-Local Development necessitates running a version of OpenHands that is as similar as possible to the version running in the SAAS Environment. Before running these steps, it is assumed you have a local development version of the OSS OpenHands project running.
+Local Development necessitates running a version of OpenHands that is as similar as possible to the version running in the SAAS Environment. Before running these steps, it is assumed you have a local development version of OpenHands running.
 
 #### Redis
 
@@ -167,7 +160,11 @@ A Local redis instance is required for clustered communication between server no
 A Local postgres instance is required. I used the official docker image:
 `docker run -p 5432:5432 --name my-postgres -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=openhands -d postgres`
 Run the alembic migrations:
-`poetry run alembic upgrade head `
+`poetry run alembic upgrade head`
+
+> **Note:** By default, migrations use the `pg8000` driver (matching production,
+> which connects through the Cloud SQL connector on pg8000). To use psycopg2 instead,
+> set `DB_DRIVER=''` before running alembic commands.
 
 #### VSCode launch.json
 
@@ -201,9 +198,8 @@ And then invoking `printenv`. NOTE: _DO NOT DO THIS WITH PROD!!!_ (Hopefully by 
                 "DEBUG": "1",
                 "FILE_STORE": "local",
                 "REDIS_HOST": "localhost:6379",
-                "OPENHANDS": "<YOUR LOCAL OSS OPENHANDS DIR>",
-                "FRONTEND_DIRECTORY": "<YOUR LOCAL OSS OPENHANDS DIR>/frontend/build",
-                "SANDBOX_RUNTIME_CONTAINER_IMAGE": "ghcr.io/openhands/runtime:main-nikolaik",
+                "OPENHANDS": "<YOUR LOCAL OPENHANDS DIR>",
+                "FRONTEND_DIRECTORY": "<YOUR LOCAL OPENHANDS DIR>/frontend/build",
                 "FILE_STORE_PATH": "<YOUR HOME DIRECTORY>>/.openhands-state",
                 "OPENHANDS_CONFIG_CLS": "server.config.SaaSServerConfig",
                 "GITHUB_APP_ID": "1062351",
@@ -235,9 +231,8 @@ And then invoking `printenv`. NOTE: _DO NOT DO THIS WITH PROD!!!_ (Hopefully by 
                 "DEBUG": "1",
                 "FILE_STORE": "local",
                 "REDIS_HOST": "localhost:6379",
-                "OPENHANDS": "<YOUR LOCAL OSS OPENHANDS DIR>",
-                "FRONTEND_DIRECTORY": "<YOUR LOCAL OSS OPENHANDS DIR>/frontend/build",
-                "SANDBOX_RUNTIME_CONTAINER_IMAGE": "ghcr.io/openhands/runtime:main-nikolaik",
+                "OPENHANDS": "<YOUR LOCAL OPENHANDS DIR>",
+                "FRONTEND_DIRECTORY": "<YOUR LOCAL OPENHANDS DIR>/frontend/build",
                 "FILE_STORE_PATH": "<YOUR HOME DIRECTORY>>/.openhands-state",
                 "OPENHANDS_CONFIG_CLS": "server.config.SaaSServerConfig",
                 "GITHUB_APP_ID": "1062351",

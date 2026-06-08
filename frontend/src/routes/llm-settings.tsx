@@ -1,153 +1,182 @@
 import React from "react";
-import { useTranslation } from "react-i18next";
-import { AxiosError } from "axios";
 import { useSearchParams } from "react-router";
+import { useTranslation } from "react-i18next";
+import { FaChevronLeft } from "react-icons/fa6";
 import { ModelSelector } from "#/components/shared/modals/settings/model-selector";
-import { organizeModelsAndProviders } from "#/utils/organize-models-and-providers";
-import { useAIConfigOptions } from "#/hooks/query/use-ai-config-options";
+import { createPermissionGuard } from "#/utils/org/permission-guard";
+import { requireOrgDefaultsRedirect } from "#/utils/org/saas-redirect-to-org-defaults-guard";
+import { useAgentSettingsSchema } from "#/hooks/query/use-agent-settings-schema";
 import { useSettings } from "#/hooks/query/use-settings";
-import { hasAdvancedSettingsSet } from "#/utils/has-advanced-settings-set";
-import { useSaveSettings } from "#/hooks/mutation/use-save-settings";
-import { SettingsSwitch } from "#/components/features/settings/settings-switch";
-import { TooltipButton } from "#/components/shared/buttons/tooltip-button";
-import QuestionCircleIcon from "#/icons/question-circle.svg?react";
-import { I18nKey } from "#/i18n/declaration";
 import { SettingsInput } from "#/components/features/settings/settings-input";
 import { HelpLink } from "#/ui/help-link";
-import { BrandButton } from "#/components/features/settings/brand-button";
+import { useConfig } from "#/hooks/query/use-config";
+import { KeyStatusIcon } from "#/components/features/settings/key-status-icon";
+import { OpenHandsApiKeyHelp } from "#/components/features/settings/openhands-api-key-help";
+import {
+  SdkSectionHeaderProps,
+  SdkSectionPage,
+} from "#/components/features/settings/sdk-settings/sdk-section-page";
+import { I18nKey } from "#/i18n/declaration";
 import {
   displayErrorToast,
   displaySuccessToast,
 } from "#/utils/custom-toast-handlers";
-import { retrieveAxiosErrorMessage } from "#/utils/retrieve-axios-error-message";
-import { SettingsDropdownInput } from "#/components/features/settings/settings-dropdown-input";
-import { useConfig } from "#/hooks/query/use-config";
-import { isCustomModel } from "#/utils/is-custom-model";
-import { LlmSettingsInputsSkeleton } from "#/components/features/settings/llm-settings/llm-settings-inputs-skeleton";
-import { KeyStatusIcon } from "#/components/features/settings/key-status-icon";
+import { Settings, SettingsSchema, SettingsScope } from "#/types/settings";
+import { extractModelAndProvider } from "#/utils/extract-model-and-provider";
+import {
+  inferInitialView,
+  type SettingsView,
+} from "#/utils/sdk-settings-schema";
 import { DEFAULT_SETTINGS } from "#/services/settings";
-import { getProviderId } from "#/utils/map-provider";
-import { DEFAULT_OPENHANDS_MODEL } from "#/utils/verified-models";
+import { useSaveLlmProfile } from "#/hooks/mutation/use-save-llm-profile";
+import { useActivateLlmProfile } from "#/hooks/mutation/use-activate-llm-profile";
+import { useRenameLlmProfile } from "#/hooks/mutation/use-rename-llm-profile";
+import {
+  useSaveOrgLlmProfile,
+  useActivateOrgLlmProfile,
+  useRenameOrgLlmProfile,
+} from "#/hooks/mutation/use-org-llm-profile-mutations";
+import {
+  deriveProfileNameFromModel,
+  PROFILE_NAME_PATTERN,
+} from "#/utils/derive-profile-name";
+import { LlmProfilesManager } from "#/components/features/settings/llm-profiles-manager";
+import { OrgLlmProfilesManager } from "#/components/features/settings/org-llm-profiles-manager";
+import { ProfileNameInput } from "#/components/features/settings/profile-name-input";
+import { Typography } from "#/ui/typography";
+import { useOrgTypeAndAccess } from "#/hooks/use-org-type-and-access";
 
-interface OpenHandsApiKeyHelpProps {
-  testId: string;
-}
+const LLM_EXCLUDED_KEYS = new Set(["llm.model", "llm.api_key", "llm.base_url"]);
 
-function OpenHandsApiKeyHelp({ testId }: OpenHandsApiKeyHelpProps) {
-  const { t } = useTranslation();
+const buildModelId = (provider: string | null, model: string | null) => {
+  if (!provider || !model) return null;
+  return `${provider}/${model}`;
+};
 
-  return (
-    <>
-      <HelpLink
-        testId={testId}
-        text={t(I18nKey.SETTINGS$OPENHANDS_API_KEY_HELP_TEXT)}
-        linkText={t(I18nKey.SETTINGS$NAV_API_KEYS)}
-        href="https://app.all-hands.dev/settings/api-keys"
-        suffix={` ${t(I18nKey.SETTINGS$OPENHANDS_API_KEY_HELP_SUFFIX)}`}
-      />
-      <p className="text-xs">
-        {t(I18nKey.SETTINGS$LLM_BILLING_INFO)}{" "}
-        <a
-          href="https://docs.all-hands.dev/usage/llms/openhands-llms"
-          rel="noreferrer noopener"
-          target="_blank"
-          className="underline underline-offset-2"
-        >
-          {t(I18nKey.SETTINGS$SEE_PRICING_DETAILS)}
-        </a>
-      </p>
-    </>
+const getSchemaFieldDefaultValue = (
+  schema: SettingsSchema | null | undefined,
+  fieldKey: string,
+) =>
+  schema?.sections
+    .flatMap((section) => section.fields)
+    .find((field) => field.key === fieldKey)?.default ?? null;
+
+const KNOWN_PROVIDER_DEFAULT_BASE_URLS: Partial<Record<string, Set<string>>> = {
+  openai: new Set(["https://api.openai.com", "https://api.openai.com/v1"]),
+  openhands: new Set([
+    "https://llm-proxy.app.all-hands.dev",
+    "https://llm-proxy.app.all-hands.dev/v1",
+  ]),
+  litellm_proxy: new Set([
+    "https://llm-proxy.app.all-hands.dev",
+    "https://llm-proxy.app.all-hands.dev/v1",
+  ]),
+};
+
+const normalizeBaseUrl = (baseUrl: string) => {
+  try {
+    const parsedUrl = new URL(baseUrl);
+    const normalizedPath = parsedUrl.pathname.replace(/\/+$/, "") || "";
+    return `${parsedUrl.origin}${normalizedPath}`;
+  } catch {
+    return baseUrl.trim().replace(/\/+$/, "");
+  }
+};
+
+const isProviderDefaultBaseUrl = (model: string, baseUrl: string) => {
+  const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+  const { provider } = extractModelAndProvider(model);
+
+  if (provider) {
+    const knownDefaults = KNOWN_PROVIDER_DEFAULT_BASE_URLS[provider];
+    if (knownDefaults) {
+      return knownDefaults.has(normalizedBaseUrl);
+    }
+  }
+
+  return Object.values(KNOWN_PROVIDER_DEFAULT_BASE_URLS).some((knownDefaults) =>
+    knownDefaults?.has(normalizedBaseUrl),
   );
-}
+};
 
-function LlmSettingsScreen() {
+export function LlmSettingsScreen({
+  scope = "personal",
+}: {
+  scope?: SettingsScope;
+}) {
   const { t } = useTranslation();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const { mutate: saveSettings, isPending } = useSaveSettings();
-
-  const { data: resources } = useAIConfigOptions();
-  const { data: settings, isLoading, isFetching } = useSettings();
+  const { data: settings } = useSettings(scope);
+  const { data: schema } = useAgentSettingsSchema(
+    settings?.agent_settings_schema,
+  );
   const { data: config } = useConfig();
+  const { isPersonalOrg, organizationId } = useOrgTypeAndAccess();
 
-  const [view, setView] = React.useState<"basic" | "advanced">("basic");
+  const [selectedProvider, setSelectedProvider] = React.useState<string | null>(
+    null,
+  );
+  const hasHydratedInitialPersonalSaasViewRef = React.useRef(false);
+  // Captured during buildPayload so onSaveSuccess can derive a profile name
+  // from the exact model that was just persisted.
+  const lastSavedModelRef = React.useRef<string | null>(null);
 
-  const [dirtyInputs, setDirtyInputs] = React.useState({
-    model: false,
-    apiKey: false,
-    searchApiKey: false,
-    baseUrl: false,
-    agent: false,
-    confirmationMode: false,
-    enableDefaultCondenser: false,
-    securityAnalyzer: false,
-    condenserMaxSize: false,
-  });
+  // Personal profile hooks (for OSS mode)
+  const saveProfile = useSaveLlmProfile();
+  const activateProfile = useActivateLlmProfile();
+  const renameProfile = useRenameLlmProfile();
 
-  // Track the currently selected model to show help text
-  const [currentSelectedModel, setCurrentSelectedModel] = React.useState<
-    string | null
-  >(null);
+  // Org profile hooks (for SaaS mode with personal orgs)
+  const saveOrgProfile = useSaveOrgLlmProfile(organizationId);
+  const activateOrgProfile = useActivateOrgLlmProfile(organizationId);
+  const renameOrgProfile = useRenameOrgLlmProfile(organizationId);
 
-  // Track confirmation mode state to control security analyzer visibility
-  const [confirmationModeEnabled, setConfirmationModeEnabled] = React.useState(
-    settings?.CONFIRMATION_MODE ?? DEFAULT_SETTINGS.CONFIRMATION_MODE,
+  // Controls whether the LLM form or the Profiles list is shown. Flipping
+  // this unmounts the inactive branch, so the SdkSectionPage re-hydrates
+  // its view from ``initialViewHint`` when coming back from profiles.
+  // Enable profiles for:
+  // - Personal scope (OSS mode)
+  // - Org scope with personal org (SaaS mode)
+  const shouldShowProfilesForScope =
+    scope === "personal" || (scope === "org" && isPersonalOrg);
+  const [showProfiles, setShowProfiles] = React.useState(
+    shouldShowProfilesForScope,
+  );
+  // User-supplied profile name. Empty → fall back to deriveProfileNameFromModel
+  // in handleSaveSuccess. Reset on every form open so a stale name from the
+  // previous Add doesn't leak in.
+  const [profileName, setProfileName] = React.useState("");
+  // Snapshotted on form open so we can flag the form dirty when the user
+  // edits *only* the name — the SDK section page tracks the LLM fields but
+  // not the profile-name input that lives outside its schema.
+  const [initialProfileName, setInitialProfileName] = React.useState("");
+  // When the user clicks Basic / Advanced / All from inside the profiles
+  // view, we want the LLM form to open on *that* tier — not whatever the
+  // schema happened to infer. We stash the choice here and consume it in
+  // getInitialView below.
+  const [initialViewHint, setInitialViewHint] =
+    React.useState<SettingsView | null>(null);
+
+  // Show profiles view for personal scope OR org scope with personal org
+  const isProfilesView = shouldShowProfilesForScope && showProfiles;
+  // Use org-scoped profile operations when in org scope
+  const isOrgProfileMode = scope === "org" && isPersonalOrg;
+
+  const defaultModel = String(
+    (DEFAULT_SETTINGS.agent_settings?.llm as Record<string, unknown>)?.model ??
+      "",
   );
 
-  // Track selected security analyzer for form submission
-  const [selectedSecurityAnalyzer, setSelectedSecurityAnalyzer] =
-    React.useState(
-      settings?.SECURITY_ANALYZER === null
-        ? "none"
-        : (settings?.SECURITY_ANALYZER ?? DEFAULT_SETTINGS.SECURITY_ANALYZER),
-    );
-
-  const modelsAndProviders = organizeModelsAndProviders(
-    resources?.models || [],
-  );
+  const isSaasMode = config?.app_mode === "saas";
 
   React.useEffect(() => {
-    const determineWhetherToToggleAdvancedSettings = () => {
-      if (resources && settings) {
-        return (
-          isCustomModel(resources.models, settings.LLM_MODEL) ||
-          hasAdvancedSettingsSet({
-            ...settings,
-          })
-        );
-      }
-
-      return false;
-    };
-
-    const userSettingsIsAdvanced = determineWhetherToToggleAdvancedSettings();
-
-    if (userSettingsIsAdvanced) setView("advanced");
-    else setView("basic");
-  }, [settings, resources]);
-
-  // Initialize currentSelectedModel with the current settings
-  React.useEffect(() => {
-    if (settings?.LLM_MODEL) {
-      setCurrentSelectedModel(settings.LLM_MODEL);
+    if (settings?.llm_model) {
+      const { provider } = extractModelAndProvider(settings.llm_model);
+      setSelectedProvider(provider || null);
     }
-  }, [settings?.LLM_MODEL]);
+  }, [settings?.llm_model]);
 
-  // Update confirmation mode state when settings change
-  React.useEffect(() => {
-    if (settings?.CONFIRMATION_MODE !== undefined) {
-      setConfirmationModeEnabled(settings.CONFIRMATION_MODE);
-    }
-  }, [settings?.CONFIRMATION_MODE]);
-
-  // Update selected security analyzer state when settings change
-  React.useEffect(() => {
-    if (settings?.SECURITY_ANALYZER !== undefined) {
-      setSelectedSecurityAnalyzer(settings.SECURITY_ANALYZER || "none");
-    }
-  }, [settings?.SECURITY_ANALYZER]);
-
-  // Handle URL parameters for SaaS subscription redirects
   React.useEffect(() => {
     const checkout = searchParams.get("checkout");
 
@@ -160,543 +189,433 @@ function LlmSettingsScreen() {
     }
   }, [searchParams, setSearchParams, t]);
 
-  const handleSuccessfulMutation = () => {
-    displaySuccessToast(t(I18nKey.SETTINGS$SAVED_WARNING));
-    setDirtyInputs({
-      model: false,
-      apiKey: false,
-      searchApiKey: false,
-      baseUrl: false,
-      agent: false,
-      confirmationMode: false,
-      enableDefaultCondenser: false,
-      securityAnalyzer: false,
-      condenserMaxSize: false,
-    });
-  };
+  const infoMessageKey = React.useMemo((): I18nKey | null => {
+    if (!isSaasMode) return null;
+    return scope === "org"
+      ? I18nKey.SETTINGS$ORG_DEFAULTS_INFO
+      : I18nKey.SETTINGS$PERSONAL_AGENT_INFO;
+  }, [isSaasMode, scope]);
 
-  const handleErrorMutation = (error: AxiosError) => {
-    const errorMessage = retrieveAxiosErrorMessage(error);
-    displayErrorToast(errorMessage || t(I18nKey.ERROR$GENERIC));
-  };
-
-  const basicFormAction = (formData: FormData) => {
-    const providerDisplay = formData.get("llm-provider-input")?.toString();
-    const provider = providerDisplay
-      ? getProviderId(providerDisplay)
-      : undefined;
-    const model = formData.get("llm-model-input")?.toString();
-    const apiKey = formData.get("llm-api-key-input")?.toString();
-    const searchApiKey = formData.get("search-api-key-input")?.toString();
-    const confirmationMode =
-      formData.get("enable-confirmation-mode-switch")?.toString() === "on";
-    const securityAnalyzer = formData
-      .get("security-analyzer-input")
-      ?.toString();
-
-    const fullLlmModel = provider && model && `${provider}/${model}`;
-
-    saveSettings(
-      {
-        LLM_MODEL: fullLlmModel,
-        llm_api_key: apiKey || null,
-        SEARCH_API_KEY: searchApiKey || "",
-        CONFIRMATION_MODE: confirmationMode,
-        SECURITY_ANALYZER:
-          securityAnalyzer === "none"
-            ? null
-            : securityAnalyzer || DEFAULT_SETTINGS.SECURITY_ANALYZER,
-
-        // reset advanced settings
-        LLM_BASE_URL: DEFAULT_SETTINGS.LLM_BASE_URL,
-        AGENT: DEFAULT_SETTINGS.AGENT,
-        ENABLE_DEFAULT_CONDENSER: DEFAULT_SETTINGS.ENABLE_DEFAULT_CONDENSER,
-      },
-      {
-        onSuccess: handleSuccessfulMutation,
-        onError: handleErrorMutation,
-      },
-    );
-  };
-
-  const advancedFormAction = (formData: FormData) => {
-    const model = formData.get("llm-custom-model-input")?.toString();
-    const baseUrl = formData.get("base-url-input")?.toString();
-    const apiKey = formData.get("llm-api-key-input")?.toString();
-    const searchApiKey = formData.get("search-api-key-input")?.toString();
-    const agent = formData.get("agent-input")?.toString();
-    const confirmationMode =
-      formData.get("enable-confirmation-mode-switch")?.toString() === "on";
-    const enableDefaultCondenser =
-      formData.get("enable-memory-condenser-switch")?.toString() === "on";
-    const condenserMaxSizeStr = formData
-      .get("condenser-max-size-input")
-      ?.toString();
-    const condenserMaxSizeRaw = condenserMaxSizeStr
-      ? Number.parseInt(condenserMaxSizeStr, 10)
-      : undefined;
-    const condenserMaxSize =
-      condenserMaxSizeRaw !== undefined
-        ? Math.max(20, condenserMaxSizeRaw)
-        : undefined;
-
-    const securityAnalyzer = formData
-      .get("security-analyzer-input")
-      ?.toString();
-
-    saveSettings(
-      {
-        LLM_MODEL: model,
-        LLM_BASE_URL: baseUrl,
-        llm_api_key: apiKey || null,
-        SEARCH_API_KEY: searchApiKey || "",
-        AGENT: agent,
-        CONFIRMATION_MODE: confirmationMode,
-        ENABLE_DEFAULT_CONDENSER: enableDefaultCondenser,
-        CONDENSER_MAX_SIZE:
-          condenserMaxSize ?? DEFAULT_SETTINGS.CONDENSER_MAX_SIZE,
-        SECURITY_ANALYZER:
-          securityAnalyzer === "none"
-            ? null
-            : securityAnalyzer || DEFAULT_SETTINGS.SECURITY_ANALYZER,
-      },
-      {
-        onSuccess: handleSuccessfulMutation,
-        onError: handleErrorMutation,
-      },
-    );
-  };
-
-  const handleToggleAdvancedSettings = (isToggled: boolean) => {
-    setView(isToggled ? "advanced" : "basic");
-    setDirtyInputs({
-      model: false,
-      apiKey: false,
-      searchApiKey: false,
-      baseUrl: false,
-      agent: false,
-      confirmationMode: false,
-      enableDefaultCondenser: false,
-      securityAnalyzer: false,
-      condenserMaxSize: false,
-    });
-  };
-
-  const handleModelIsDirty = (model: string | null) => {
-    // openai providers are special case; see ModelSelector
-    // component for details
-    const modelIsDirty = model !== settings?.LLM_MODEL.replace("openai/", "");
-    setDirtyInputs((prev) => ({
-      ...prev,
-      model: modelIsDirty,
-    }));
-
-    // Track the currently selected model for help text display
-    setCurrentSelectedModel(model);
-  };
-
-  const handleApiKeyIsDirty = (apiKey: string) => {
-    const apiKeyIsDirty = apiKey !== "";
-    setDirtyInputs((prev) => ({
-      ...prev,
-      apiKey: apiKeyIsDirty,
-    }));
-  };
-
-  const handleSearchApiKeyIsDirty = (searchApiKey: string) => {
-    const searchApiKeyIsDirty = searchApiKey !== settings?.SEARCH_API_KEY;
-    setDirtyInputs((prev) => ({
-      ...prev,
-      searchApiKey: searchApiKeyIsDirty,
-    }));
-  };
-
-  const handleCustomModelIsDirty = (model: string) => {
-    const modelIsDirty = model !== settings?.LLM_MODEL && model !== "";
-    setDirtyInputs((prev) => ({
-      ...prev,
-      model: modelIsDirty,
-    }));
-
-    // Track the currently selected model for help text display
-    setCurrentSelectedModel(model);
-  };
-
-  const handleBaseUrlIsDirty = (baseUrl: string) => {
-    const baseUrlIsDirty = baseUrl !== settings?.LLM_BASE_URL;
-    setDirtyInputs((prev) => ({
-      ...prev,
-      baseUrl: baseUrlIsDirty,
-    }));
-  };
-
-  const handleAgentIsDirty = (agent: string) => {
-    const agentIsDirty = agent !== settings?.AGENT && agent !== "";
-    setDirtyInputs((prev) => ({
-      ...prev,
-      agent: agentIsDirty,
-    }));
-  };
-
-  const handleConfirmationModeIsDirty = (isToggled: boolean) => {
-    const confirmationModeIsDirty = isToggled !== settings?.CONFIRMATION_MODE;
-    setDirtyInputs((prev) => ({
-      ...prev,
-      confirmationMode: confirmationModeIsDirty,
-    }));
-    setConfirmationModeEnabled(isToggled);
-
-    // When confirmation mode is enabled, set default security analyzer to "llm" if not already set
-    if (isToggled && !selectedSecurityAnalyzer) {
-      setSelectedSecurityAnalyzer(DEFAULT_SETTINGS.SECURITY_ANALYZER);
-      setDirtyInputs((prev) => ({
-        ...prev,
-        securityAnalyzer: true,
-      }));
-    }
-  };
-
-  const handleEnableDefaultCondenserIsDirty = (isToggled: boolean) => {
-    const enableDefaultCondenserIsDirty =
-      isToggled !== settings?.ENABLE_DEFAULT_CONDENSER;
-    setDirtyInputs((prev) => ({
-      ...prev,
-      enableDefaultCondenser: enableDefaultCondenserIsDirty,
-    }));
-  };
-
-  const handleCondenserMaxSizeIsDirty = (value: string) => {
-    const parsed = value ? Number.parseInt(value, 10) : undefined;
-    const bounded = parsed !== undefined ? Math.max(20, parsed) : undefined;
-    const condenserMaxSizeIsDirty =
-      (bounded ?? DEFAULT_SETTINGS.CONDENSER_MAX_SIZE) !==
-      (settings?.CONDENSER_MAX_SIZE ?? DEFAULT_SETTINGS.CONDENSER_MAX_SIZE);
-    setDirtyInputs((prev) => ({
-      ...prev,
-      condenserMaxSize: condenserMaxSizeIsDirty,
-    }));
-  };
-
-  const handleSecurityAnalyzerIsDirty = (securityAnalyzer: string) => {
-    const securityAnalyzerIsDirty =
-      securityAnalyzer !== settings?.SECURITY_ANALYZER;
-    setDirtyInputs((prev) => ({
-      ...prev,
-      securityAnalyzer: securityAnalyzerIsDirty,
-    }));
-  };
-
-  const formIsDirty = Object.values(dirtyInputs).some((isDirty) => isDirty);
-
-  const getSecurityAnalyzerOptions = () => {
-    const analyzers = resources?.securityAnalyzers || [];
-    const orderedItems = [];
-
-    // Add LLM analyzer first
-    if (analyzers.includes("llm")) {
-      orderedItems.push({
-        key: "llm",
-        label: t(I18nKey.SETTINGS$SECURITY_ANALYZER_LLM_DEFAULT),
-      });
-    }
-
-    // Add None option second
-    orderedItems.push({
-      key: "none",
-      label: t(I18nKey.SETTINGS$SECURITY_ANALYZER_NONE),
-    });
-
-    // Add Invariant analyzer third
-    if (analyzers.includes("invariant")) {
-      orderedItems.push({
-        key: "invariant",
-        label: t(I18nKey.SETTINGS$SECURITY_ANALYZER_INVARIANT),
-      });
-    }
-
-    // Add any other analyzers that might exist
-    analyzers.forEach((analyzer) => {
-      if (!["llm", "invariant", "none"].includes(analyzer)) {
-        // For unknown analyzers, use the analyzer name as fallback
-        // In the future, add specific i18n keys for new analyzers
-        orderedItems.push({
-          key: analyzer,
-          label: analyzer, // TODO: Add i18n support for new analyzers
-        });
+  const getInitialView = React.useCallback(
+    (
+      currentSettings: Settings,
+      filteredSchema: SettingsSchema,
+    ): SettingsView => {
+      // A hint set by the Profiles mirror-strip beats every other rule —
+      // the user explicitly asked for this tier when leaving profiles.
+      if (initialViewHint) {
+        return initialViewHint;
       }
-    });
 
-    return orderedItems;
-  };
+      // Personal SaaS users now land on Available Models first; the form
+      // is mounted on-demand (Add / Edit). The first form mount per session
+      // should still default to basic so users aren't dropped straight into
+      // advanced/all even if the active profile has complex fields.
+      if (
+        isSaasMode &&
+        scope !== "org" &&
+        !hasHydratedInitialPersonalSaasViewRef.current
+      ) {
+        hasHydratedInitialPersonalSaasViewRef.current = true;
+        return "basic";
+      }
 
-  if (!settings || isFetching) return <LlmSettingsInputsSkeleton />;
+      const schemaView = inferInitialView(currentSettings, filteredSchema);
+      if (schemaView !== "basic") {
+        return schemaView;
+      }
 
-  const formAction = (formData: FormData) => {
-    if (view === "basic") basicFormAction(formData);
-    else advancedFormAction(formData);
-  };
+      const currentModel = currentSettings.llm_model ?? "";
+      const trimmedBaseUrl = currentSettings.llm_base_url?.trim() ?? "";
+      const hasCustomBaseUrl =
+        trimmedBaseUrl.length > 0 &&
+        !isProviderDefaultBaseUrl(currentModel, trimmedBaseUrl);
 
-  return (
-    <div data-testid="llm-settings-screen" className="h-full relative">
-      <form
-        action={formAction}
-        className="flex flex-col h-full justify-between"
-      >
+      return hasCustomBaseUrl ? "all" : "basic";
+    },
+    [initialViewHint, isSaasMode, scope],
+  );
+
+  const buildHeader = React.useCallback(
+    ({ values, isDisabled, view, onChange }: SdkSectionHeaderProps) => {
+      const modelValue =
+        typeof values["llm.model"] === "string" ? values["llm.model"] : "";
+      const baseUrlValue =
+        typeof values["llm.base_url"] === "string"
+          ? values["llm.base_url"]
+          : "";
+      const derivedProvider = modelValue
+        ? extractModelAndProvider(modelValue).provider || null
+        : null;
+      const activeProvider =
+        view === "basic"
+          ? (selectedProvider ?? derivedProvider)
+          : derivedProvider;
+      const shouldUseOpenHandsKey =
+        isSaasMode && activeProvider === "openhands";
+      const showOpenHandsApiKeyHelp = modelValue.startsWith("openhands/");
+
+      const renderApiKeyInput = (testId: string, helpTestId: string) => {
+        if (shouldUseOpenHandsKey) {
+          return null;
+        }
+
+        return (
+          <>
+            <SettingsInput
+              testId={testId}
+              label={t(I18nKey.SETTINGS_FORM$API_KEY)}
+              type="password"
+              className="w-full"
+              value={
+                typeof values["llm.api_key"] === "string"
+                  ? values["llm.api_key"]
+                  : ""
+              }
+              placeholder={settings?.llm_api_key_set ? "<hidden>" : ""}
+              onChange={(value) => onChange("llm.api_key", value)}
+              isDisabled={isDisabled}
+              startContent={
+                settings?.llm_api_key_set ? (
+                  <KeyStatusIcon isSet={settings.llm_api_key_set} />
+                ) : undefined
+              }
+            />
+
+            <HelpLink
+              testId={helpTestId}
+              text={t(I18nKey.SETTINGS$DONT_KNOW_API_KEY)}
+              linkText={t(I18nKey.SETTINGS$CLICK_FOR_INSTRUCTIONS)}
+              href="https://docs.openhands.dev/usage/local-setup#getting-an-api-key"
+            />
+          </>
+        );
+      };
+
+      const profileNamePlaceholder =
+        deriveProfileNameFromModel(modelValue) ?? "";
+
+      return (
         <div className="flex flex-col gap-6">
-          <SettingsSwitch
-            testId="advanced-settings-switch"
-            defaultIsToggled={view === "advanced"}
-            onToggle={handleToggleAdvancedSettings}
-            isToggled={view === "advanced"}
-          >
-            {t(I18nKey.SETTINGS$ADVANCED)}
-          </SettingsSwitch>
-
-          {view === "basic" && (
-            <div
-              data-testid="llm-settings-form-basic"
-              className="flex flex-col gap-6"
+          {infoMessageKey ? (
+            <Typography.Paragraph
+              testId="llm-settings-info-message"
+              className="text-sm text-tertiary-alt"
             >
-              {!isLoading && !isFetching && (
-                <>
-                  <ModelSelector
-                    models={modelsAndProviders}
-                    currentModel={settings.LLM_MODEL || DEFAULT_OPENHANDS_MODEL}
-                    onChange={handleModelIsDirty}
-                    wrapperClassName="!flex-col !gap-6"
-                  />
-                  {(settings.LLM_MODEL?.startsWith("openhands/") ||
-                    currentSelectedModel?.startsWith("openhands/")) && (
-                    <OpenHandsApiKeyHelp testId="openhands-api-key-help" />
-                  )}
-                </>
-              )}
+              {t(infoMessageKey)}
+            </Typography.Paragraph>
+          ) : null}
 
-              <SettingsInput
-                testId="llm-api-key-input"
-                name="llm-api-key-input"
-                label={t(I18nKey.SETTINGS_FORM$API_KEY)}
-                type="password"
-                className="w-full max-w-[680px]"
-                placeholder={settings.LLM_API_KEY_SET ? "<hidden>" : ""}
-                onChange={handleApiKeyIsDirty}
-                startContent={
-                  settings.LLM_API_KEY_SET && (
-                    <KeyStatusIcon isSet={settings.LLM_API_KEY_SET} />
-                  )
-                }
-              />
+          {shouldShowProfilesForScope ? (
+            <ProfileNameInput
+              testId="llm-profile-name-input"
+              ruleTestId="llm-profile-name-rule"
+              value={profileName}
+              placeholder={profileNamePlaceholder}
+              onChange={setProfileName}
+              isDisabled={isDisabled}
+              isOptional
+            />
+          ) : null}
 
-              <HelpLink
-                testId="llm-api-key-help-anchor"
-                text={t(I18nKey.SETTINGS$DONT_KNOW_API_KEY)}
-                linkText={t(I18nKey.SETTINGS$CLICK_FOR_INSTRUCTIONS)}
-                href="https://docs.all-hands.dev/usage/local-setup#getting-an-api-key"
-              />
-            </div>
-          )}
-
-          {view === "advanced" && (
+          {view === "basic" ? (
             <div
-              data-testid="llm-settings-form-advanced"
               className="flex flex-col gap-6"
+              data-testid="llm-settings-form-basic"
+            >
+              <ModelSelector
+                currentModel={modelValue || undefined}
+                onChange={(provider, model) => {
+                  setSelectedProvider(provider);
+                  const nextModel = buildModelId(provider, model);
+                  if (nextModel) {
+                    onChange("llm.model", nextModel);
+                  }
+                }}
+                wrapperClassName="!flex-col !gap-6"
+                isDisabled={isDisabled}
+              />
+
+              {showOpenHandsApiKeyHelp ? (
+                <OpenHandsApiKeyHelp testId="openhands-api-key-help" />
+              ) : null}
+
+              {renderApiKeyInput(
+                "llm-api-key-input",
+                "llm-api-key-help-anchor",
+              )}
+            </div>
+          ) : (
+            <div
+              className="flex flex-col gap-6"
+              data-testid="llm-settings-form-advanced"
             >
               <SettingsInput
                 testId="llm-custom-model-input"
-                name="llm-custom-model-input"
                 label={t(I18nKey.SETTINGS$CUSTOM_MODEL)}
-                defaultValue={settings.LLM_MODEL || DEFAULT_OPENHANDS_MODEL}
-                placeholder={DEFAULT_OPENHANDS_MODEL}
                 type="text"
-                className="w-full max-w-[680px]"
-                onChange={handleCustomModelIsDirty}
+                className="w-full"
+                value={modelValue}
+                placeholder={defaultModel}
+                onChange={(value) => onChange("llm.model", value)}
+                isDisabled={isDisabled}
               />
-              {(settings.LLM_MODEL?.startsWith("openhands/") ||
-                currentSelectedModel?.startsWith("openhands/")) && (
+
+              {showOpenHandsApiKeyHelp ? (
                 <OpenHandsApiKeyHelp testId="openhands-api-key-help-2" />
-              )}
+              ) : null}
 
               <SettingsInput
                 testId="base-url-input"
-                name="base-url-input"
                 label={t(I18nKey.SETTINGS$BASE_URL)}
-                defaultValue={settings.LLM_BASE_URL}
-                placeholder="https://api.openai.com"
                 type="text"
-                className="w-full max-w-[680px]"
-                onChange={handleBaseUrlIsDirty}
+                className="w-full"
+                value={baseUrlValue}
+                placeholder="https://api.openai.com"
+                onChange={(value) => onChange("llm.base_url", value)}
+                isDisabled={isDisabled}
               />
 
-              <SettingsInput
-                testId="llm-api-key-input"
-                name="llm-api-key-input"
-                label={t(I18nKey.SETTINGS_FORM$API_KEY)}
-                type="password"
-                className="w-full max-w-[680px]"
-                placeholder={settings.LLM_API_KEY_SET ? "<hidden>" : ""}
-                onChange={handleApiKeyIsDirty}
-                startContent={
-                  settings.LLM_API_KEY_SET && (
-                    <KeyStatusIcon isSet={settings.LLM_API_KEY_SET} />
-                  )
-                }
-              />
-              <HelpLink
-                testId="llm-api-key-help-anchor-advanced"
-                text={t(I18nKey.SETTINGS$DONT_KNOW_API_KEY)}
-                linkText={t(I18nKey.SETTINGS$CLICK_FOR_INSTRUCTIONS)}
-                href="https://docs.all-hands.dev/usage/local-setup#getting-an-api-key"
-              />
-
-              {config?.APP_MODE !== "saas" && (
-                <>
-                  <SettingsInput
-                    testId="search-api-key-input"
-                    name="search-api-key-input"
-                    label={t(I18nKey.SETTINGS$SEARCH_API_KEY)}
-                    type="password"
-                    className="w-full max-w-[680px]"
-                    defaultValue={settings.SEARCH_API_KEY || ""}
-                    onChange={handleSearchApiKeyIsDirty}
-                    placeholder={t(I18nKey.API$TVLY_KEY_EXAMPLE)}
-                    startContent={
-                      settings.SEARCH_API_KEY_SET && (
-                        <KeyStatusIcon isSet={settings.SEARCH_API_KEY_SET} />
-                      )
-                    }
-                  />
-
-                  <HelpLink
-                    testId="search-api-key-help-anchor"
-                    text={t(I18nKey.SETTINGS$SEARCH_API_KEY_OPTIONAL)}
-                    linkText={t(I18nKey.SETTINGS$SEARCH_API_KEY_INSTRUCTIONS)}
-                    href="https://tavily.com/"
-                  />
-
-                  <SettingsDropdownInput
-                    testId="agent-input"
-                    name="agent-input"
-                    label={t(I18nKey.SETTINGS$AGENT)}
-                    items={
-                      resources?.agents.map((agent) => ({
-                        key: agent,
-                        label: agent, // TODO: Add i18n support for agent names
-                      })) || []
-                    }
-                    defaultSelectedKey={settings.AGENT}
-                    isClearable={false}
-                    onInputChange={handleAgentIsDirty}
-                    wrapperClassName="w-full max-w-[680px]"
-                  />
-                </>
-              )}
-
-              <div className="w-full max-w-[680px]">
-                <SettingsInput
-                  testId="condenser-max-size-input"
-                  name="condenser-max-size-input"
-                  type="number"
-                  min={20}
-                  step={1}
-                  label={t(I18nKey.SETTINGS$CONDENSER_MAX_SIZE)}
-                  defaultValue={(
-                    settings.CONDENSER_MAX_SIZE ??
-                    DEFAULT_SETTINGS.CONDENSER_MAX_SIZE
-                  )?.toString()}
-                  onChange={(value) => handleCondenserMaxSizeIsDirty(value)}
-                  isDisabled={!settings.ENABLE_DEFAULT_CONDENSER}
-                />
-                <p className="text-xs text-tertiary-alt mt-1">
-                  {t(I18nKey.SETTINGS$CONDENSER_MAX_SIZE_TOOLTIP)}
-                </p>
-              </div>
-
-              <SettingsSwitch
-                testId="enable-memory-condenser-switch"
-                name="enable-memory-condenser-switch"
-                defaultIsToggled={settings.ENABLE_DEFAULT_CONDENSER}
-                onToggle={handleEnableDefaultCondenserIsDirty}
-              >
-                {t(I18nKey.SETTINGS$ENABLE_MEMORY_CONDENSATION)}
-              </SettingsSwitch>
-
-              {/* Confirmation mode and security analyzer */}
-              <div className="flex items-center gap-2">
-                <SettingsSwitch
-                  testId="enable-confirmation-mode-switch"
-                  name="enable-confirmation-mode-switch"
-                  onToggle={handleConfirmationModeIsDirty}
-                  defaultIsToggled={settings.CONFIRMATION_MODE}
-                  isBeta
-                >
-                  {t(I18nKey.SETTINGS$CONFIRMATION_MODE)}
-                </SettingsSwitch>
-                <TooltipButton
-                  tooltip={t(I18nKey.SETTINGS$CONFIRMATION_MODE_TOOLTIP)}
-                  ariaLabel={t(I18nKey.SETTINGS$CONFIRMATION_MODE)}
-                  className="text-[#9099AC] hover:text-white cursor-help"
-                >
-                  <QuestionCircleIcon width={16} height={16} />
-                </TooltipButton>
-              </div>
-
-              {confirmationModeEnabled && (
-                <>
-                  <div className="w-full max-w-[680px]">
-                    <SettingsDropdownInput
-                      testId="security-analyzer-input"
-                      name="security-analyzer-display"
-                      label={t(I18nKey.SETTINGS$SECURITY_ANALYZER)}
-                      items={getSecurityAnalyzerOptions()}
-                      placeholder={t(
-                        I18nKey.SETTINGS$SECURITY_ANALYZER_PLACEHOLDER,
-                      )}
-                      selectedKey={selectedSecurityAnalyzer || "none"}
-                      isClearable={false}
-                      onSelectionChange={(key) => {
-                        const newValue = key?.toString() || "";
-                        setSelectedSecurityAnalyzer(newValue);
-                        handleSecurityAnalyzerIsDirty(newValue);
-                      }}
-                      onInputChange={(value) => {
-                        // Handle when input is cleared
-                        if (!value) {
-                          setSelectedSecurityAnalyzer("");
-                          handleSecurityAnalyzerIsDirty("");
-                        }
-                      }}
-                      wrapperClassName="w-full"
-                    />
-                    {/* Hidden input to store the actual key value for form submission */}
-                    <input
-                      type="hidden"
-                      name="security-analyzer-input"
-                      value={selectedSecurityAnalyzer || ""}
-                    />
-                  </div>
-                  <p className="text-xs text-tertiary-alt max-w-[680px]">
-                    {t(I18nKey.SETTINGS$SECURITY_ANALYZER_DESCRIPTION)}
-                  </p>
-                </>
+              {renderApiKeyInput(
+                "llm-api-key-input",
+                "llm-api-key-help-anchor-advanced",
               )}
             </div>
           )}
         </div>
+      );
+    },
+    [
+      infoMessageKey,
+      isSaasMode,
+      defaultModel,
+      profileName,
+      scope,
+      selectedProvider,
+      settings?.llm_api_key_set,
+      shouldShowProfilesForScope,
+      t,
+    ],
+  );
 
-        <div className="flex gap-6 p-6 justify-end">
-          <BrandButton
-            testId="submit-button"
-            type="submit"
-            variant="primary"
-            isDisabled={!formIsDirty || isPending}
-          >
-            {!isPending && t("SETTINGS$SAVE_CHANGES")}
-            {isPending && t("SETTINGS$SAVING")}
-          </BrandButton>
-        </div>
-      </form>
+  const buildPayload = React.useCallback(
+    (
+      defaultPayload: Record<string, unknown>,
+      context: {
+        values: Record<string, string | boolean>;
+        view: SettingsView;
+      },
+    ) => {
+      // defaultPayload is the wrapped diff (e.g.
+      // `{ agent_settings_diff: { llm: { model: "gpt-4" } } }`); we only
+      // mutate the inner `llm` object below.
+      const agentSettings = structuredClone(
+        (defaultPayload.agent_settings_diff as Record<string, unknown>) ?? {},
+      );
+
+      const modelValue =
+        typeof context.values["llm.model"] === "string"
+          ? context.values["llm.model"]
+          : "";
+      const derivedProvider = modelValue
+        ? extractModelAndProvider(modelValue).provider || null
+        : null;
+      const activeProvider =
+        context.view === "basic"
+          ? (selectedProvider ?? derivedProvider)
+          : derivedProvider;
+      const shouldUseOpenHandsKey =
+        isSaasMode && activeProvider === "openhands";
+
+      const llm = (agentSettings.llm ?? {}) as Record<string, unknown>;
+      if (shouldUseOpenHandsKey && llm.model !== undefined) {
+        llm.api_key = "";
+        agentSettings.llm = llm;
+      }
+
+      if (context.view === "basic") {
+        llm.base_url = getSchemaFieldDefaultValue(schema, "llm.base_url");
+        agentSettings.llm = llm;
+      }
+
+      // Remember the model currently shown in the form — this is what the
+      // user is saving regardless of whether `llm.model` was toggled dirty
+      // this turn. ``defaultPayload`` only includes dirty fields, so
+      // falling back to ``context.values`` makes the profile auto-creation
+      // fire on same-value re-saves (e.g. save → delete profile → save
+      // again).
+      lastSavedModelRef.current = modelValue || null;
+
+      return { agent_settings_diff: agentSettings };
+    },
+    [isSaasMode, schema, scope, selectedProvider],
+  );
+
+  const handleSaveSuccess = React.useCallback(async () => {
+    const savedModel = lastSavedModelRef.current;
+    const trimmedUserName = profileName.trim();
+    // Use the user-supplied name only if it matches the backend regex —
+    // otherwise silently fall back to the model-derived default (the helper
+    // text under the input has already warned them their name was invalid).
+    const userName = PROFILE_NAME_PATTERN.test(trimmedUserName)
+      ? trimmedUserName
+      : null;
+    const derivedName = savedModel
+      ? deriveProfileNameFromModel(savedModel)
+      : null;
+    const name = userName ?? derivedName;
+
+    // Auto-saved profiles for:
+    // - Personal scope (OSS mode)
+    // - Org scope with personal org (SaaS mode)
+    const shouldSaveProfile =
+      (scope === "personal" || (scope === "org" && isPersonalOrg)) && name;
+
+    if (shouldSaveProfile) {
+      try {
+        // Use org profile hooks for org scope, personal hooks for personal scope
+        const useOrgHooks = scope === "org" && isPersonalOrg;
+
+        // Editing an existing profile and renaming it via the form should
+        // rename the record in place rather than spawning a new one and
+        // leaving the original orphaned.
+        if (initialProfileName && initialProfileName !== name) {
+          if (useOrgHooks) {
+            await renameOrgProfile.mutateAsync({
+              name: initialProfileName,
+              newName: name,
+            });
+          } else {
+            await renameProfile.mutateAsync({
+              name: initialProfileName,
+              newName: name,
+            });
+          }
+        }
+        // Omit `llm` → backend snapshots the just-saved agent_settings.llm
+        // (api_key and all). Saves us from having to hand-reconstruct the
+        // config and risk mangling the secret placeholder handling.
+        if (useOrgHooks) {
+          await saveOrgProfile.mutateAsync({
+            name,
+            request: { include_secrets: true },
+          });
+          await activateOrgProfile.mutateAsync(name);
+        } else {
+          await saveProfile.mutateAsync({
+            name,
+            request: { include_secrets: true },
+          });
+          await activateProfile.mutateAsync(name);
+        }
+      } catch {
+        // Best-effort: the settings save already succeeded. Profile cap
+        // (HTTP 409) and transient errors are surfaced on the Profiles page.
+      }
+    }
+
+    setProfileName("");
+    setInitialProfileName("");
+    setInitialViewHint(null);
+    setShowProfiles(true);
+  }, [
+    activateProfile,
+    activateOrgProfile,
+    initialProfileName,
+    isPersonalOrg,
+    profileName,
+    renameProfile,
+    renameOrgProfile,
+    saveProfile,
+    saveOrgProfile,
+    scope,
+  ]);
+
+  const openForm = (view: SettingsView | null, name = "") => {
+    setProfileName(name);
+    setInitialProfileName(name);
+    setInitialViewHint(view);
+    setShowProfiles(false);
+  };
+
+  if (isProfilesView) {
+    // Use org profiles manager for personal orgs in SaaS mode
+    if (isOrgProfileMode && organizationId) {
+      return (
+        <OrgLlmProfilesManager
+          orgId={organizationId}
+          onAddProfile={() => openForm(null)}
+          onEditProfile={(profile) => openForm(null, profile.name)}
+        />
+      );
+    }
+    // Use personal profiles manager for OSS mode
+    return (
+      <LlmProfilesManager
+        onAddProfile={() => openForm(null)}
+        onEditProfile={(profile) => openForm(null, profile.name)}
+      />
+    );
+  }
+
+  // Sub-page back affordance when profiles are enabled (personal scope or
+  // personal org). Replaces the previous "Profiles" trailing action so the
+  // form view follows the second-level settings pattern.
+  const backToProfiles = shouldShowProfilesForScope ? (
+    <button
+      data-testid="llm-back-to-profiles"
+      type="button"
+      onClick={() => {
+        setInitialViewHint(null);
+        setShowProfiles(true);
+      }}
+      className="flex items-center gap-2 self-start text-sm text-gray-300 hover:text-white cursor-pointer"
+    >
+      <FaChevronLeft size={12} aria-hidden="true" />
+      {t(I18nKey.SETTINGS$BACK_TO_LLM_LIST)}
+    </button>
+  ) : null;
+
+  return (
+    <div className="flex flex-col gap-4">
+      {backToProfiles}
+      <SdkSectionPage
+        scope={scope}
+        settingsSources={[
+          {
+            settingsSource: "agent_settings",
+            sectionKeys: ["llm"],
+            excludeKeys: LLM_EXCLUDED_KEYS,
+          },
+        ]}
+        header={buildHeader}
+        buildPayload={buildPayload}
+        // The profile form can always be saved: it snapshots the current LLM
+        // config as a profile, and the name is optional — it falls back to a
+        // model-derived default in handleSaveSuccess. So don't gate Save on the
+        // settings fields being dirty. This matters in SaaS managed mode, where
+        // the model is fixed and there's no editable API key, leaving the form
+        // pristine and Save stuck disabled.
+        extraDirty={shouldShowProfilesForScope}
+        onSaveSuccess={handleSaveSuccess}
+        getInitialView={getInitialView}
+        forceShowAdvancedView
+        allowAllView={!isSaasMode}
+        testId="llm-settings-screen"
+      />
     </div>
   );
 }
+
+const orgDefaultsRedirectGuard = requireOrgDefaultsRedirect(
+  "/settings/org-defaults",
+);
+const llmPermissionGuard = createPermissionGuard("view_llm_settings");
+
+export const clientLoader = async (args: { request: Request }) => {
+  const blocked = await orgDefaultsRedirectGuard(args);
+  if (blocked) return blocked;
+  return llmPermissionGuard(args);
+};
 
 export default LlmSettingsScreen;

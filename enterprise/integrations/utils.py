@@ -1,59 +1,93 @@
 from __future__ import annotations
 
-import json
 import os
 import re
-from typing import TYPE_CHECKING
 
 from jinja2 import Environment, FileSystemLoader
 from server.constants import WEB_HOST
-from storage.repository_store import RepositoryStore
-from storage.stored_repository import StoredRepository
-from storage.user_repo_map import UserRepositoryMap
-from storage.user_repo_map_store import UserRepositoryMapStore
 
-from openhands.core.config.openhands_config import OpenHandsConfig
-from openhands.core.logger import openhands_logger as logger
-from openhands.core.schema.agent import AgentState
-from openhands.events import Event, EventSource
-from openhands.events.action import (
-    AgentFinishAction,
-    MessageAction,
-)
-from openhands.events.event_store_abc import EventStoreABC
-from openhands.events.observation.agent import AgentStateChangedObservation
-from openhands.integrations.service_types import Repository
-from openhands.storage.data_models.conversation_status import ConversationStatus
-
-if TYPE_CHECKING:
-    from openhands.server.conversation_manager.conversation_manager import (
-        ConversationManager,
-    )
+from openhands.app_server.integrations.service_types import Repository
 
 # ---- DO NOT REMOVE ----
 # WARNING: Langfuse depends on the WEB_HOST environment variable being set to track events.
 HOST = WEB_HOST
 # ---- DO NOT REMOVE ----
 
-HOST_URL = f'https://{HOST}'
-GITHUB_WEBHOOK_URL = f'{HOST_URL}/integration/github/events'
+IS_LOCAL_DEPLOYMENT = 'localhost' in HOST
+HOST_URL = f'https://{HOST}' if not IS_LOCAL_DEPLOYMENT else f'http://{HOST}'
 GITLAB_WEBHOOK_URL = f'{HOST_URL}/integration/gitlab/events'
-conversation_prefix = 'conversations/{}'
-CONVERSATION_URL = f'{HOST_URL}/{conversation_prefix}'
+CONVERSATION_URL = f'{HOST_URL}/conversations/{{}}'
 
 # Toggle for auto-response feature that proactively starts conversations with users when workflow tests fail
 ENABLE_PROACTIVE_CONVERSATION_STARTERS = (
     os.getenv('ENABLE_PROACTIVE_CONVERSATION_STARTERS', 'false').lower() == 'true'
 )
 
-# Toggle for solvability report feature
-ENABLE_SOLVABILITY_ANALYSIS = (
-    os.getenv('ENABLE_SOLVABILITY_ANALYSIS', 'false').lower() == 'true'
+
+def get_session_expired_message(username: str | None = None) -> str:
+    """Get a user-friendly session expired message.
+
+    Used by integrations to notify users when their Keycloak offline session
+    has expired.
+
+    Args:
+        username: Optional username to mention in the message. If provided,
+                  the message will include @username prefix (used by Git providers
+                  like GitHub, GitLab, Slack). If None, returns a generic message
+                  (used by Jira, Jira DC, Linear).
+
+    Returns:
+        A formatted session expired message
+    """
+    if username:
+        return f'@{username} your session has expired. Please login again at [OpenHands Cloud]({HOST_URL}) and try again.'
+    return f'Your session has expired. Please login again at [OpenHands Cloud]({HOST_URL}) and try again.'
+
+
+def get_user_not_found_message(username: str | None = None) -> str:
+    """Get a user-friendly message when a user hasn't created an OpenHands account.
+
+    Used by integrations to notify users when they try to use OpenHands features
+    but haven't logged into OpenHands Cloud yet (no Keycloak account exists).
+
+    Args:
+        username: Optional username to mention in the message. If provided,
+                  the message will include @username prefix (used by Git providers
+                  like GitHub, GitLab, Slack). If None, returns a generic message.
+
+    Returns:
+        A formatted user not found message
+    """
+    if username:
+        return f"@{username} it looks like you haven't created an OpenHands account yet. Please sign up at [OpenHands Cloud]({HOST_URL}) and try again."
+    return f"It looks like you haven't created an OpenHands account yet. Please sign up at [OpenHands Cloud]({HOST_URL}) and try again."
+
+
+def get_account_not_linked_message(username: str | None = None) -> str:
+    """Get a message when a user has an OpenHands account but hasn't linked it.
+
+    Used by workspace-linking integrations (e.g. Jira Data Center) when the user
+    has a Keycloak account but hasn't linked their platform identity to the
+    workspace yet, so the resolver can't act on their behalf. This is distinct
+    from get_user_not_found_message, which is for users with no account at all.
+
+    Args:
+        username: Optional username to mention in the message. If provided, the
+                  message is prefixed with @username; otherwise it is generic.
+
+    Returns:
+        A formatted account-not-linked message.
+    """
+    if username:
+        return f"@{username} you have an OpenHands account but haven't linked it to this workspace yet. Please link it at [OpenHands Cloud]({HOST_URL}) under Settings > Integrations and try again."
+    return f"You have an OpenHands account but haven't linked it to this workspace yet. Please link it at [OpenHands Cloud]({HOST_URL}) under Settings > Integrations and try again."
+
+
+OPENHANDS_RESOLVER_TEMPLATES_DIR = (
+    os.getenv('OPENHANDS_RESOLVER_TEMPLATES_DIR')
+    or 'openhands/app_server/integrations/templates/resolver/'
 )
-
-
-OPENHANDS_RESOLVER_TEMPLATES_DIR = 'openhands/integrations/templates/resolver/'
-jinja_env = Environment(loader=FileSystemLoader(OPENHANDS_RESOLVER_TEMPLATES_DIR))
+_jinja_env = Environment(loader=FileSystemLoader(OPENHANDS_RESOLVER_TEMPLATES_DIR))
 
 
 def get_oh_labels(web_host: str) -> tuple[str, str]:
@@ -75,7 +109,7 @@ def get_oh_labels(web_host: str) -> tuple[str, str]:
 
 
 def get_summary_instruction():
-    summary_instruction_template = jinja_env.get_template('summary_prompt.j2')
+    summary_instruction_template = _jinja_env.get_template('summary_prompt.j2')
     summary_instruction = summary_instruction_template.render()
     return summary_instruction
 
@@ -106,320 +140,84 @@ def has_exact_mention(text: str, mention: str) -> bool:
     return bool(re.search(rf'(?:^|[^\w@]){pattern}(?![\w-])', text_lower))
 
 
-def confirm_event_type(event: Event):
-    return isinstance(event, AgentStateChangedObservation) and not (
-        event.agent_state == AgentState.REJECTED
-        or event.agent_state == AgentState.USER_CONFIRMED
-        or event.agent_state == AgentState.USER_REJECTED
-        or event.agent_state == AgentState.LOADING
-        or event.agent_state == AgentState.RUNNING
-    )
-
-
-def get_readable_error_reason(reason: str):
-    if reason == 'STATUS$ERROR_LLM_AUTHENTICATION':
-        reason = 'Authentication with the LLM provider failed. Please check your API key or credentials'
-    elif reason == 'STATUS$ERROR_LLM_SERVICE_UNAVAILABLE':
-        reason = 'The LLM service is temporarily unavailable. Please try again later'
-    elif reason == 'STATUS$ERROR_LLM_INTERNAL_SERVER_ERROR':
-        reason = 'The LLM provider encountered an internal error. Please try again soon'
-    elif reason == 'STATUS$ERROR_LLM_OUT_OF_CREDITS':
-        reason = "You've run out of credits. Please top up to continue"
-    elif reason == 'STATUS$ERROR_LLM_CONTENT_POLICY_VIOLATION':
-        reason = 'Content policy violation. The output was blocked by content filtering policy'
-    return reason
-
-
-def get_summary_for_agent_state(
-    observations: list[AgentStateChangedObservation], conversation_link: str
-) -> str:
-    unknown_error_msg = f'OpenHands encountered an unknown error. [See the conversation]({conversation_link}) for more information, or try again'
-
-    if len(observations) == 0:
-        logger.error(
-            'Unknown error: No agent state observations found',
-            extra={'conversation_link': conversation_link},
-        )
-        return unknown_error_msg
-
-    observation: AgentStateChangedObservation = observations[0]
-    state = observation.agent_state
-
-    if state == AgentState.RATE_LIMITED:
-        logger.warning(
-            'Agent was rate limited',
-            extra={
-                'agent_state': state.value,
-                'conversation_link': conversation_link,
-                'observation_reason': getattr(observation, 'reason', None),
-            },
-        )
-        return 'OpenHands was rate limited by the LLM provider. Please try again later.'
-
-    if state == AgentState.ERROR:
-        reason = observation.reason
-        reason = get_readable_error_reason(reason)
-
-        logger.error(
-            'Agent encountered an error',
-            extra={
-                'agent_state': state.value,
-                'conversation_link': conversation_link,
-                'observation_reason': observation.reason,
-                'readable_reason': reason,
-            },
-        )
-
-        return f'OpenHands encountered an error: **{reason}**.\n\n[See the conversation]({conversation_link}) for more information.'
-
-    if state == AgentState.AWAITING_USER_INPUT:
-        logger.info(
-            'Agent is awaiting user input',
-            extra={
-                'agent_state': state.value,
-                'conversation_link': conversation_link,
-                'observation_reason': getattr(observation, 'reason', None),
-            },
-        )
-        return f'OpenHands is waiting for your input. [Continue the conversation]({conversation_link}) to provide additional instructions.'
-
-    # Log unknown agent state as error
-    logger.error(
-        'Unknown error: Unhandled agent state',
-        extra={
-            'agent_state': state.value if hasattr(state, 'value') else str(state),
-            'conversation_link': conversation_link,
-            'observation_reason': getattr(observation, 'reason', None),
-        },
-    )
-    return unknown_error_msg
-
-
-def get_final_agent_observation(
-    event_store: EventStoreABC,
-) -> list[AgentStateChangedObservation]:
-    return event_store.get_matching_events(
-        source=EventSource.ENVIRONMENT,
-        event_types=(AgentStateChangedObservation,),
-        limit=1,
-        reverse=True,
-    )
-
-
-def get_last_user_msg(event_store: EventStoreABC) -> list[MessageAction]:
-    return event_store.get_matching_events(
-        source=EventSource.USER, event_types=(MessageAction,), limit=1, reverse='true'
-    )
-
-
-def extract_summary_from_event_store(
-    event_store: EventStoreABC, conversation_id: str
-) -> str:
-    """
-    Get agent summary or alternative message depending on current AgentState
-    """
-    conversation_link = CONVERSATION_URL.format(conversation_id)
-    summary_instruction = get_summary_instruction()
-
-    instruction_event: list[MessageAction] = event_store.get_matching_events(
-        query=json.dumps(summary_instruction),
-        source=EventSource.USER,
-        event_types=(MessageAction,),
-        limit=1,
-        reverse=True,
-    )
-
-    final_agent_observation = get_final_agent_observation(event_store)
-
-    # Find summary instruction event ID
-    if len(instruction_event) == 0:
-        logger.warning(
-            'no_instruction_event_found', extra={'conversation_id': conversation_id}
-        )
-        return get_summary_for_agent_state(
-            final_agent_observation, conversation_link
-        )  # Agent did not receive summary instruction
-
-    event_id: int = instruction_event[0].id
-
-    agent_messages: list[MessageAction | AgentFinishAction] = (
-        event_store.get_matching_events(
-            start_id=event_id,
-            source=EventSource.AGENT,
-            event_types=(MessageAction, AgentFinishAction),
-            reverse=True,
-            limit=1,
-        )
-    )
-
-    if len(agent_messages) == 0:
-        logger.warning(
-            'no_agent_messages_found', extra={'conversation_id': conversation_id}
-        )
-        return get_summary_for_agent_state(
-            final_agent_observation, conversation_link
-        )  # Agent failed to generate summary
-
-    summary_event: MessageAction | AgentFinishAction = agent_messages[0]
-    if isinstance(summary_event, MessageAction):
-        return summary_event.content
-
-    return summary_event.final_thought
-
-
-async def get_event_store_from_conversation_manager(
-    conversation_manager: ConversationManager, conversation_id: str
-) -> EventStoreABC:
-    agent_loop_infos = await conversation_manager.get_agent_loop_info(
-        filter_to_sids={conversation_id}
-    )
-    if not agent_loop_infos or agent_loop_infos[0].status != ConversationStatus.RUNNING:
-        raise RuntimeError(f'conversation_not_running:{conversation_id}')
-    event_store = agent_loop_infos[0].event_store
-    if not event_store:
-        raise RuntimeError(f'event_store_missing:{conversation_id}')
-    return event_store
-
-
-async def get_last_user_msg_from_conversation_manager(
-    conversation_manager: ConversationManager, conversation_id: str
-):
-    event_store = await get_event_store_from_conversation_manager(
-        conversation_manager, conversation_id
-    )
-    return get_last_user_msg(event_store)
-
-
-async def extract_summary_from_conversation_manager(
-    conversation_manager: ConversationManager, conversation_id: str
-) -> str:
-    """
-    Get agent summary or alternative message depending on current AgentState
-    """
-
-    event_store = await get_event_store_from_conversation_manager(
-        conversation_manager, conversation_id
-    )
-    summary = extract_summary_from_event_store(event_store, conversation_id)
-    return append_conversation_footer(summary, conversation_id)
-
-
-def append_conversation_footer(message: str, conversation_id: str) -> str:
-    """
-    Append a small footer with the conversation URL to a message.
-
-    Args:
-        message: The original message content
-        conversation_id: The conversation ID to link to
-
-    Returns:
-        The message with the conversation footer appended
-    """
-    conversation_link = CONVERSATION_URL.format(conversation_id)
-    footer = f'\n\n<sub>[View full conversation]({conversation_link})</sub>'
-    return message + footer
-
-
-async def store_repositories_in_db(repos: list[Repository], user_id: str) -> None:
-    """
-    Store repositories in DB and create user-repository mappings
-
-    Args:
-        repos: List of Repository objects to store
-        user_id: User ID associated with these repositories
-    """
-
-    # Convert Repository objects to StoredRepository objects
-    # Convert Repository objects to UserRepositoryMap objects
-    stored_repos = []
-    user_repos = []
-    for repo in repos:
-        repo_id = f'{repo.git_provider.value}##{str(repo.id)}'
-        stored_repo = StoredRepository(
-            repo_name=repo.full_name,
-            repo_id=repo_id,
-            is_public=repo.is_public,
-            # Optional fields set to None by default
-            has_microagent=None,
-            has_setup_script=None,
-        )
-        stored_repos.append(stored_repo)
-        user_repo_map = UserRepositoryMap(user_id=user_id, repo_id=repo_id, admin=None)
-
-        user_repos.append(user_repo_map)
-
-    # Get config instance
-    config = OpenHandsConfig()
-
-    try:
-        # Store repositories in the repos table
-        repo_store = RepositoryStore.get_instance(config)
-        repo_store.store_projects(stored_repos)
-
-        # Store user-repository mappings in the user-repos table
-        user_repo_store = UserRepositoryMapStore.get_instance(config)
-        user_repo_store.store_user_repo_mappings(user_repos)
-
-        logger.info(f'Saved repos for user {user_id}')
-    except Exception:
-        logger.warning('Failed to save repos', exc_info=True)
-
-
 def infer_repo_from_message(user_msg: str) -> list[str]:
+    """Extract repository names as 'owner/repo' from URLs and direct mentions.
+
+    Supports cloud and self-hosted Git providers: GitHub / GitHub Enterprise,
+    GitLab (incl. self-hosted), Bitbucket Cloud, and Bitbucket Data Center.
+    Bitbucket Data Center URLs use a distinct layout
+    (``/projects/<KEY>/repos/<slug>`` and ``/scm/<KEY>/<slug>``) that maps to
+    the ``<KEY>/<slug>`` full name; every other provider uses the standard
+    ``<host>/<owner>/<repo>`` layout, so the host is matched generically rather
+    than against a cloud allowlist. Over-broad matches are harmless: callers
+    only act on inferred names that resolve to a repo the user can access.
     """
-    Extract all repository names in the format 'owner/repo' from various Git provider URLs
-    and direct mentions in text. Supports GitHub, GitLab, and BitBucket.
-    Args:
-        user_msg: Input message that may contain repository references
-    Returns:
-        List of repository names in 'owner/repo' format, empty list if none found
-    """
-    # Normalize the message by removing extra whitespace and newlines
     normalized_msg = re.sub(r'\s+', ' ', user_msg.strip())
 
-    # Pattern to match Git URLs from GitHub, GitLab, and BitBucket
-    # Captures: protocol, domain, owner, repo (with optional .git extension)
-    git_url_pattern = r'https?://(?:github\.com|gitlab\.com|bitbucket\.org)/([a-zA-Z0-9_.-]+)/([a-zA-Z0-9_.-]+?)(?:\.git)?(?:[/?#].*?)?(?=\s|$|[^\w.-])'
-
-    # Pattern to match direct owner/repo mentions (e.g., "OpenHands/OpenHands")
-    # Must be surrounded by word boundaries or specific characters to avoid false positives
-    direct_pattern = (
-        r'(?:^|\s|[\[\(\'"])([a-zA-Z0-9_.-]+)/([a-zA-Z0-9_.-]+)(?=\s|$|[\]\)\'",.])'
+    # Bitbucket Data Center web (browse/PR) URLs: /projects/<KEY>/repos/<slug>
+    # and personal /users/<name>/repos/<slug>. Matched before the generic
+    # pattern so the <KEY>/<slug> full name is captured rather than the literal
+    # 'projects'/'users' path segment.
+    bitbucket_dc_web_pattern = (
+        r'https?://[a-zA-Z0-9.-]+(?::\d+)?/(?:projects|users)/'
+        r'([a-zA-Z0-9_~.-]+)/repos/([a-zA-Z0-9_.-]+)'
+    )
+    # Bitbucket Data Center clone URLs: /scm/<KEY>/<slug>(.git).
+    bitbucket_dc_scm_pattern = (
+        r'https?://[a-zA-Z0-9.-]+(?::\d+)?/scm/'
+        r'([a-zA-Z0-9_~.-]+)/([a-zA-Z0-9_.-]+?)(?:\.git)?(?=[/?#\s]|$)'
     )
 
-    matches = []
+    # Generic Git host (cloud or self-hosted): github.com, a GitHub Enterprise
+    # host, self-hosted GitLab, etc. The negative lookahead defers the
+    # Bitbucket Data Center layouts above to their dedicated patterns.
+    git_url_pattern = (
+        r'https?://[a-zA-Z0-9.-]+(?::\d+)?/'
+        r'(?!projects/|scm/|users/)'
+        r'([a-zA-Z0-9_.-]+)/([a-zA-Z0-9_.-]+?)(?:\.git)?'
+        r'(?:[/?#].*?)?(?=\s|$|[^\w.-])'
+    )
 
-    # First, find all Git URLs (highest priority)
-    git_matches = re.findall(git_url_pattern, normalized_msg)
-    for owner, repo in git_matches:
-        # Remove .git extension if present
+    # UPDATED: allow {{ owner/repo }} in addition to existing boundaries
+    direct_pattern = (
+        r'(?:^|\s|{{|[\[\(\'":`])'  # left boundary
+        r'([a-zA-Z0-9_.-]+)/([a-zA-Z0-9_.-]+)'
+        r'(?=\s|$|}}|[\]\)\'",.:`])'  # right boundary
+    )
+
+    # Use dict to preserve ordering
+    matches: dict[str, bool] = {}
+
+    # Bitbucket Data Center URLs first (most specific layout)
+    for owner, repo in re.findall(bitbucket_dc_web_pattern, normalized_msg):
+        matches[f'{owner}/{repo}'] = True
+    for owner, repo in re.findall(bitbucket_dc_scm_pattern, normalized_msg):
         repo = re.sub(r'\.git$', '', repo)
-        matches.append(f'{owner}/{repo}')
+        matches[f'{owner}/{repo}'] = True
 
-    # Second, find all direct owner/repo mentions
-    direct_matches = re.findall(direct_pattern, normalized_msg)
-    for owner, repo in direct_matches:
+    # Generic Git URLs next (highest priority among the standard layout)
+    for owner, repo in re.findall(git_url_pattern, normalized_msg):
+        repo = re.sub(r'\.git$', '', repo)
+        matches[f'{owner}/{repo}'] = True
+
+    # Direct mentions
+    for owner, repo in re.findall(direct_pattern, normalized_msg):
         full_match = f'{owner}/{repo}'
 
-        # Skip if it looks like a version number, date, or file path
         if (
-            re.match(r'^\d+\.\d+/\d+\.\d+$', full_match)  # version numbers
-            or re.match(r'^\d{1,2}/\d{1,2}$', full_match)  # dates
-            or re.match(r'^[A-Z]/[A-Z]$', full_match)  # single letters
-            or repo.endswith('.txt')
-            or repo.endswith('.md')  # file extensions
-            or repo.endswith('.py')
-            or repo.endswith('.js')
-            or '.' in repo
-            and len(repo.split('.')) > 2
-        ):  # complex file paths
+            re.match(r'^\d+\.\d+/\d+\.\d+$', full_match)
+            or re.match(r'^\d{1,2}/\d{1,2}$', full_match)
+            or re.match(r'^[A-Z]/[A-Z]$', full_match)
+            or repo.endswith(('.txt', '.md', '.py', '.js'))
+            or ('.' in repo and len(repo.split('.')) > 2)
+        ):
             continue
 
-        # Avoid duplicates from Git URLs already found
         if full_match not in matches:
-            matches.append(full_match)
+            matches[full_match] = True
 
-    return matches
+    result = list(matches)
+    return result
 
 
 def filter_potential_repos_by_user_msg(
@@ -555,3 +353,18 @@ def markdown_to_jira_markup(markdown_text: str) -> str:
         # Log the error but don't raise it - return original text as fallback
         print(f'Error converting markdown to Jira markup: {str(e)}')
         return markdown_text or ''
+
+
+def format_jira_comment_body(message: str) -> dict:
+    """Format a message as a Jira API v2 comment body.
+
+    This helper ensures consistent comment formatting across all Jira integrations.
+    Converts markdown to Jira Wiki Markup and wraps in the expected API structure.
+
+    Args:
+        message: The message content to send (may contain markdown)
+
+    Returns:
+        dict: The comment body in Jira API v2 format {'body': ...}
+    """
+    return {'body': markdown_to_jira_markup(message)}

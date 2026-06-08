@@ -6,37 +6,87 @@ HOST = os.getenv('WEB_HOST', 'app.all-hands.dev').strip()
 
 # Check if this is a feature environment
 # Feature environments have a host format like {some-text}.staging.all-hands.dev
+# or {some-text}.ohe-staging.platform-team.all-hands.dev (for platform-team sandbox)
 # Just staging.all-hands.dev doesn't count as a feature environment
 IS_STAGING_ENV = bool(
-    re.match(r'^.+\.staging\.all-hands\.dev$', HOST) or HOST == 'staging.all-hands.dev'
+    re.match(r'^.+\.staging\.all-hands\.dev$', HOST)
+    or re.match(r'^.+\.ohe-staging\.platform-team\.all-hands\.dev$', HOST)
+    or HOST == 'staging.all-hands.dev'
 )  # Includes the staging deployment + feature deployments
 IS_FEATURE_ENV = (
     IS_STAGING_ENV and HOST != 'staging.all-hands.dev'
 )  # Does not include the staging deployment
 IS_LOCAL_ENV = bool(HOST == 'localhost')
 
+
+# _is_all_hands_managed_domain() can be removed/replaced when a self-hosted specific
+# env var is created (e.g is_self_hosted` or `deployment_mode`)
+def _is_all_hands_managed_domain(host: str) -> bool:
+    """Check if the host is an All-Hands managed domain."""
+    return (
+        host == 'app.all-hands.dev'
+        or host == 'app.openhands.ai'
+        or host.endswith('.all-hands.dev')
+        or host.endswith('.openhands.ai')
+    )
+
+
+def _get_deployment_mode() -> str:
+    """Determine deployment mode based on WEB_HOST.
+
+    Returns:
+        'cloud' for All-Hands managed infrastructure (app.all-hands.dev, etc.)
+        'self_hosted' for enterprise self-hosted deployments (customer domains)
+    """
+    if _is_all_hands_managed_domain(HOST):
+        return 'cloud'
+    return 'self_hosted'
+
+
+DEPLOYMENT_MODE = _get_deployment_mode()
+
+# Role name constants
+ROLE_OWNER = 'owner'
+ROLE_ADMIN = 'admin'
+ROLE_MEMBER = 'member'
+
 # Deprecated - billing margins are now handled internally in litellm
 DEFAULT_BILLING_MARGIN = float(os.environ.get('DEFAULT_BILLING_MARGIN', '1.0'))
 
 # Map of user settings versions to their corresponding default LLM models
-# This ensures that CURRENT_USER_SETTINGS_VERSION and LITELLM_DEFAULT_MODEL stay in sync
-USER_SETTINGS_VERSION_TO_MODEL = {
+# This ensures that PERSONAL_WORKSPACE_VERSION_TO_MODEL and LITELLM_DEFAULT_MODEL stay in sync
+PERSONAL_WORKSPACE_VERSION_TO_MODEL = {
     1: 'claude-3-5-sonnet-20241022',
     2: 'claude-3-7-sonnet-20250219',
     3: 'claude-sonnet-4-20250514',
     4: 'claude-sonnet-4-20250514',
+    5: 'minimax-m2.5',
+    6: 'minimax-m2.7',
 }
 
 LITELLM_DEFAULT_MODEL = os.getenv('LITELLM_DEFAULT_MODEL')
+OPENHANDS_LLM_PROVIDER_ROUTE = os.getenv('OPENHANDS_LLM_PROVIDER_ROUTE')
+OPENHANDS_DEFAULT_LLM_MODEL = os.getenv('OPENHANDS_DEFAULT_LLM_MODEL') or os.getenv(
+    'LLM_MODEL'
+)
+OPENHANDS_DEFAULT_LLM_BASE_URL = os.getenv(
+    'OPENHANDS_DEFAULT_LLM_BASE_URL'
+) or os.getenv('LLM_BASE_URL')
+OPENHANDS_DEFAULT_LLM_API_KEY = os.getenv('OPENHANDS_DEFAULT_LLM_API_KEY') or os.getenv(
+    'LLM_API_KEY'
+)
 
 # Current user settings version - this should be the latest key in USER_SETTINGS_VERSION_TO_MODEL
-CURRENT_USER_SETTINGS_VERSION = max(USER_SETTINGS_VERSION_TO_MODEL.keys())
+ORG_SETTINGS_VERSION = max(PERSONAL_WORKSPACE_VERSION_TO_MODEL.keys())
+PERSONAL_WORKSPACE_VERSION = max(PERSONAL_WORKSPACE_VERSION_TO_MODEL.keys())
 
 LITE_LLM_API_URL = os.environ.get(
     'LITE_LLM_API_URL', 'https://llm-proxy.app.all-hands.dev'
 )
 LITE_LLM_TEAM_ID = os.environ.get('LITE_LLM_TEAM_ID', None)
 LITE_LLM_API_KEY = os.environ.get('LITE_LLM_API_KEY', None)
+# Timeout in seconds for BYOR key verification requests to LiteLLM
+BYOR_KEY_VERIFICATION_TIMEOUT = 5.0
 SUBSCRIPTION_PRICE_DATA = {
     'MONTHLY_SUBSCRIPTION': {
         'unit_amount': 2000,
@@ -50,9 +100,7 @@ SUBSCRIPTION_PRICE_DATA = {
     },
 }
 
-DEFAULT_INITIAL_BUDGET = float(os.environ.get('DEFAULT_INITIAL_BUDGET', '10'))
 STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY', None)
-STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', None)
 REQUIRE_PAYMENT = os.environ.get('REQUIRE_PAYMENT', '0') in ('1', 'true')
 
 SLACK_CLIENT_ID = os.environ.get('SLACK_CLIENT_ID', None)
@@ -68,39 +116,59 @@ PERMITTED_CORS_ORIGINS = [
     )
 ]
 
+# Controls whether new orgs/users default to V1 API (env: DEFAULT_V1_ENABLED)
+DEFAULT_V1_ENABLED = os.getenv('DEFAULT_V1_ENABLED', '1').lower() in ('1', 'true')
+
 
 def build_litellm_proxy_model_path(model_name: str) -> str:
-    """
-    Build the LiteLLM proxy model path based on environment and model name.
-
-    This utility constructs the full model path for LiteLLM proxy based on:
-    - Environment type (staging vs prod)
-    - The provided model name
+    """Build the LiteLLM proxy model path based on model name.
 
     Args:
         model_name: The base model name (e.g., 'claude-3-7-sonnet-20250219')
 
     Returns:
-        The full LiteLLM proxy model path (e.g., 'litellm_proxy/prod/claude-3-7-sonnet-20250219')
+        The full LiteLLM proxy model path (e.g., 'litellm_proxy/claude-3-7-sonnet-20250219')
     """
-
-    if 'prod' in model_name or 'litellm' in model_name or 'proxy' in model_name:
+    if 'litellm' in model_name:
         raise ValueError("Only include model name, don't include prefix")
 
-    prefix = 'litellm_proxy/'
-
-    if not IS_STAGING_ENV and not IS_LOCAL_ENV:
-        prefix += 'prod/'
-
-    return prefix + model_name
+    return 'litellm_proxy/' + model_name
 
 
 def get_default_litellm_model():
-    """
-    Construct proxy for litellm model based on user settings and environment type (staging vs prod)
-    if not set explicitly
-    """
+    """Construct proxy for litellm model based on user settings if not set explicitly."""
     if LITELLM_DEFAULT_MODEL:
         return LITELLM_DEFAULT_MODEL
-    model = USER_SETTINGS_VERSION_TO_MODEL[CURRENT_USER_SETTINGS_VERSION]
+    model = PERSONAL_WORKSPACE_VERSION_TO_MODEL[PERSONAL_WORKSPACE_VERSION]
     return build_litellm_proxy_model_path(model)
+
+
+def should_use_direct_llm_defaults() -> bool:
+    """Whether defaults should point directly at an OpenAI-compatible endpoint."""
+    return (
+        OPENHANDS_LLM_PROVIDER_ROUTE == 'direct'
+        and bool(OPENHANDS_DEFAULT_LLM_MODEL)
+        and bool(OPENHANDS_DEFAULT_LLM_BASE_URL)
+    )
+
+
+def get_default_llm_model() -> str:
+    """Return the deployment default LLM model."""
+    if should_use_direct_llm_defaults() and OPENHANDS_DEFAULT_LLM_MODEL:
+        return OPENHANDS_DEFAULT_LLM_MODEL
+    return get_default_litellm_model()
+
+
+def get_default_llm_base_url() -> str:
+    """Return the deployment default LLM base URL."""
+    if should_use_direct_llm_defaults() and OPENHANDS_DEFAULT_LLM_BASE_URL:
+        return OPENHANDS_DEFAULT_LLM_BASE_URL
+    return LITE_LLM_API_URL
+
+
+def get_default_llm_api_key() -> str | None:
+    """Return the optional shared deployment default LLM API key."""
+    if not should_use_direct_llm_defaults() or not OPENHANDS_DEFAULT_LLM_API_KEY:
+        return None
+    key = OPENHANDS_DEFAULT_LLM_API_KEY.strip()
+    return key or None

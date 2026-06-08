@@ -7,10 +7,25 @@ import { GitRepository } from "#/types/git";
 import { sanitizeQuery } from "#/utils/sanitize-query";
 import { PRODUCT_URL } from "#/utils/constants";
 import { AgentState } from "#/types/agent-state";
+import { I18nKey } from "#/i18n/declaration";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
+
+/**
+ * Trigger a download for a provided Blob with the given filename
+ */
+export const downloadBlob = (blob: Blob, filename: string): void => {
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.URL.revokeObjectURL(url);
+};
 
 /**
  * Get the numeric height value from an element's style property
@@ -41,15 +56,31 @@ export const setStyleHeightPx = (el: HTMLElement, height: number): void => {
 };
 
 /**
- * Detect if the user is on a mobile device
- * @returns True if the user is on a mobile device, false otherwise
+ * Detect if the user is on a mobile device.
+ * Touch support alone is not sufficient — touchscreen laptops have touch
+ * but use a mouse/trackpad as primary input. We check that the primary
+ * pointing device is coarse (finger) to avoid false positives.
  */
-export const isMobileDevice = (): boolean =>
-  /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
-    navigator.userAgent,
-  ) ||
-  "ontouchstart" in window ||
-  navigator.maxTouchPoints > 0;
+export const isMobileDevice = (): boolean => {
+  if (
+    /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+      navigator.userAgent,
+    )
+  )
+    return true;
+
+  const hasTouch = "ontouchstart" in window || navigator.maxTouchPoints > 0;
+  if (!hasTouch) return false;
+
+  // If matchMedia is available, check whether the primary pointer is fine
+  // (mouse/trackpad). Touchscreen laptops report fine, real mobile devices don't.
+  if (typeof window.matchMedia === "function") {
+    return !window.matchMedia("(pointer: fine)").matches;
+  }
+
+  // Fallback: touch present but no matchMedia — assume mobile
+  return true;
+};
 
 /**
  * Checks if the current domain is the production domain
@@ -115,28 +146,6 @@ export const removeUnwantedKeys = (
     });
 };
 
-export const removeApiKey = (
-  data: EventActionHistory[],
-): EventActionHistory[] =>
-  data.map((item) => {
-    // Create a shallow copy of item
-    const newItem = { ...item };
-
-    // Check if LLM_API_KEY exists and delete it from a new args object
-    if (newItem.args?.LLM_API_KEY) {
-      const newArgs = { ...newItem.args };
-      delete newArgs.LLM_API_KEY;
-      newItem.args = newArgs;
-    }
-
-    return newItem;
-  });
-
-export const getExtension = (code: string) => {
-  if (code.includes(".")) return code.split(".").pop() || "";
-  return "";
-};
-
 /**
  * Get file extension from file name in uppercase format
  * @param fileName The file name to extract extension from
@@ -152,25 +161,6 @@ export const getFileExtension = (fileName: string): string => {
   return extension || "FILE";
 };
 
-/**
- * Format a timestamp to a human-readable format
- * @param timestamp The timestamp to format (ISO 8601)
- * @returns The formatted timestamp
- *
- * @example
- * formatTimestamp("2021-10-10T10:10:10.000") // "10/10/2021, 10:10:10"
- * formatTimestamp("2021-10-10T22:10:10.000") // "10/10/2021, 22:10:10"
- */
-export const formatTimestamp = (timestamp: string) =>
-  new Date(timestamp).toLocaleString("en-GB", {
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-
 export const shouldUseInstallationRepos = (
   provider: Provider,
   app_mode: "saas" | "oss" | undefined,
@@ -179,8 +169,11 @@ export const shouldUseInstallationRepos = (
 
   switch (provider) {
     case "bitbucket":
+    case "bitbucket_data_center":
       return true;
     case "gitlab":
+      return false;
+    case "azure_devops":
       return false;
     case "github":
       return app_mode === "saas";
@@ -189,17 +182,9 @@ export const shouldUseInstallationRepos = (
   }
 };
 
-export const getGitProviderBaseUrl = (gitProvider: Provider): string => {
-  switch (gitProvider) {
-    case "github":
-      return "https://github.com";
-    case "gitlab":
-      return "https://gitlab.com";
-    case "bitbucket":
-      return "https://bitbucket.org";
-    default:
-      return "";
-  }
+export const ensureHttpsPrefix = (host?: string | null): string => {
+  if (!host || host.trim() === "") return "";
+  return host.startsWith("http") ? host : `https://${host}`;
 };
 
 /**
@@ -210,6 +195,9 @@ export const getGitProviderBaseUrl = (gitProvider: Provider): string => {
 export const getProviderName = (gitProvider: Provider) => {
   if (gitProvider === "gitlab") return "GitLab";
   if (gitProvider === "bitbucket") return "Bitbucket";
+  if (gitProvider === "bitbucket_data_center") return "Bitbucket Data Center";
+  if (gitProvider === "azure_devops") return "Azure DevOps";
+  if (gitProvider === "forgejo") return "Forgejo";
   return "GitHub";
 };
 
@@ -227,71 +215,6 @@ export const getPR = (isGitLab: boolean) =>
  * @returns The short name of the PR
  */
 export const getPRShort = (isGitLab: boolean) => (isGitLab ? "MR" : "PR");
-
-/**
- * Construct the pull request (merge request) URL for different providers
- * @param prNumber The pull request number
- * @param provider The git provider
- * @param repositoryName The repository name in format "owner/repo"
- * @returns The pull request URL
- *
- * @example
- * constructPullRequestUrl(123, "github", "owner/repo") // "https://github.com/owner/repo/pull/123"
- * constructPullRequestUrl(456, "gitlab", "owner/repo") // "https://gitlab.com/owner/repo/-/merge_requests/456"
- * constructPullRequestUrl(789, "bitbucket", "owner/repo") // "https://bitbucket.org/owner/repo/pull-requests/789"
- */
-export const constructPullRequestUrl = (
-  prNumber: number,
-  provider: Provider,
-  repositoryName: string,
-): string => {
-  const baseUrl = getGitProviderBaseUrl(provider);
-
-  switch (provider) {
-    case "github":
-      return `${baseUrl}/${repositoryName}/pull/${prNumber}`;
-    case "gitlab":
-      return `${baseUrl}/${repositoryName}/-/merge_requests/${prNumber}`;
-    case "bitbucket":
-      return `${baseUrl}/${repositoryName}/pull-requests/${prNumber}`;
-    default:
-      return "";
-  }
-};
-
-/**
- * Construct the microagent URL for different providers
- * @param gitProvider The git provider
- * @param repositoryName The repository name in format "owner/repo"
- * @param microagentPath The path to the microagent in the repository
- * @returns The URL to the microagent file in the Git provider
- *
- * @example
- * constructMicroagentUrl("github", "owner/repo", ".openhands/microagents/tell-me-a-joke.md")
- * // "https://github.com/owner/repo/blob/main/.openhands/microagents/tell-me-a-joke.md"
- * constructMicroagentUrl("gitlab", "owner/repo", "microagents/git-helper.md")
- * // "https://gitlab.com/owner/repo/-/blob/main/microagents/git-helper.md"
- * constructMicroagentUrl("bitbucket", "owner/repo", ".openhands/microagents/docker-helper.md")
- * // "https://bitbucket.org/owner/repo/src/main/.openhands/microagents/docker-helper.md"
- */
-export const constructMicroagentUrl = (
-  gitProvider: Provider,
-  repositoryName: string,
-  microagentPath: string,
-): string => {
-  const baseUrl = getGitProviderBaseUrl(gitProvider);
-
-  switch (gitProvider) {
-    case "github":
-      return `${baseUrl}/${repositoryName}/blob/main/${microagentPath}`;
-    case "gitlab":
-      return `${baseUrl}/${repositoryName}/-/blob/main/${microagentPath}`;
-    case "bitbucket":
-      return `${baseUrl}/${repositoryName}/src/main/${microagentPath}`;
-    default:
-      return "";
-  }
-};
 
 /**
  * Extract repository owner, repo name, and file path from repository and microagent data
@@ -326,8 +249,13 @@ export const extractRepositoryInfo = (
 export const constructRepositoryUrl = (
   provider: Provider,
   repositoryName: string,
+  host?: string | null,
 ): string => {
-  const baseUrl = getGitProviderBaseUrl(provider);
+  const baseUrl = ensureHttpsPrefix(host);
+  if (provider === "bitbucket_data_center") {
+    const [project, repo] = repositoryName.split("/");
+    return `${baseUrl}/projects/${project}/repos/${repo}`;
+  }
   return `${baseUrl}/${repositoryName}`;
 };
 
@@ -336,27 +264,50 @@ export const constructRepositoryUrl = (
  * @param provider The git provider
  * @param repositoryName The repository name in format "owner/repo"
  * @param branchName The branch name
+ * @param host Optional custom host for self-hosted instances
  * @returns The branch URL
  *
  * @example
  * constructBranchUrl("github", "owner/repo", "main") // "https://github.com/owner/repo/tree/main"
  * constructBranchUrl("gitlab", "owner/repo", "develop") // "https://gitlab.com/owner/repo/-/tree/develop"
  * constructBranchUrl("bitbucket", "owner/repo", "feature") // "https://bitbucket.org/owner/repo/src/feature"
+ * constructBranchUrl("bitbucket", "PROJECT/repo", "feature", "server.com") // "https://server.com/projects/PROJECT/repos/repo/browse?at=refs/heads/feature"
  */
 export const constructBranchUrl = (
   provider: Provider,
   repositoryName: string,
   branchName: string,
+  host?: string | null,
 ): string => {
-  const baseUrl = getGitProviderBaseUrl(provider);
+  const baseUrl = ensureHttpsPrefix(host);
 
   switch (provider) {
     case "github":
       return `${baseUrl}/${repositoryName}/tree/${branchName}`;
+    case "forgejo":
+      return `${baseUrl}/${repositoryName}/src/branch/${branchName}`;
     case "gitlab":
       return `${baseUrl}/${repositoryName}/-/tree/${branchName}`;
     case "bitbucket":
       return `${baseUrl}/${repositoryName}/src/${branchName}`;
+    case "bitbucket_data_center": {
+      // Bitbucket Server format: /projects/{PROJECT}/repos/{repo}/browse?at=refs/heads/{branch}
+      const parts = repositoryName.split("/");
+      if (parts.length >= 2) {
+        const [project, repo] = parts;
+        return `${baseUrl}/projects/${project}/repos/${repo}/browse?at=refs/heads/${branchName}`;
+      }
+      return "";
+    }
+    case "azure_devops": {
+      // Azure DevOps format: org/project/repo
+      const parts = repositoryName.split("/");
+      if (parts.length === 3) {
+        const [org, project, repo] = parts;
+        return `${baseUrl}/${org}/${project}/_git/${repo}?version=GB${branchName}`;
+      }
+      return "";
+    }
     default:
       return "";
   }
@@ -574,10 +525,15 @@ export const shouldIncludeRepository = (
  * @returns The query string for searching OpenHands repositories
  */
 export const getOpenHandsQuery = (provider: Provider | null): string => {
-  if (provider === "gitlab") {
-    return "openhands-config";
-  }
-  return ".openhands";
+  const providerRepositorySuffix: Record<string, string> = {
+    gitlab: "openhands-config",
+    azure_devops: "openhands-config",
+    default: ".openhands",
+  } as const;
+
+  return provider && provider in providerRepositorySuffix
+    ? providerRepositorySuffix[provider]
+    : providerRepositorySuffix.default;
 };
 
 /**
@@ -589,12 +545,7 @@ export const getOpenHandsQuery = (provider: Provider | null): string => {
 export const hasOpenHandsSuffix = (
   repo: GitRepository,
   provider: Provider | null,
-): boolean => {
-  if (provider === "gitlab") {
-    return repo.full_name.endsWith("/openhands-config");
-  }
-  return repo.full_name.endsWith("/.openhands");
-};
+): boolean => repo.full_name.endsWith(`/${getOpenHandsQuery(provider)}`);
 
 /**
  * Build headers for V1 API requests that require session authentication
@@ -610,6 +561,22 @@ export const buildSessionHeaders = (
   }
   return headers;
 };
+
+/**
+ * Check if a task is currently being polled (loading state)
+ * @param taskStatus The task status string (e.g., "WORKING", "ERROR", "READY")
+ * @returns True if the task is in a loading state (not ERROR and not READY)
+ *
+ * @example
+ * isTaskPolling("WORKING") // Returns true
+ * isTaskPolling("PREPARING_REPOSITORY") // Returns true
+ * isTaskPolling("READY") // Returns false
+ * isTaskPolling("ERROR") // Returns false
+ * isTaskPolling(null) // Returns false
+ * isTaskPolling(undefined) // Returns false
+ */
+export const isTaskPolling = (taskStatus: string | null | undefined): boolean =>
+  !!taskStatus && taskStatus !== "ERROR" && taskStatus !== "READY";
 
 /**
  * Get the appropriate color based on agent status
@@ -673,3 +640,91 @@ export const getStatusColor = (options: {
   }
   return "#BCFF8C";
 };
+
+interface GetStatusTextArgs {
+  isPausing: boolean;
+  isTask: boolean;
+  taskStatus?: string | null;
+  taskDetail?: string | null;
+  isStartingStatus: boolean;
+  isStopStatus: boolean;
+  curAgentState: AgentState;
+  errorMessage?: string | null;
+  t: (t: string) => string;
+}
+
+/**
+ * Get the server status text based on agent and task state
+ *
+ * @param options Configuration object for status text calculation
+ * @param options.isPausing Whether the agent is currently pausing
+ * @param options.isTask Whether we're polling a task
+ * @param options.taskStatus The task status string (e.g., "ERROR", "READY")
+ * @param options.taskDetail Optional task-specific detail text
+ * @param options.isStartingStatus Whether the conversation is in STARTING state
+ * @param options.isStopStatus Whether the conversation is STOPPED
+ * @param options.curAgentState The current agent state
+ * @param options.errorMessage Optional agent error message
+ * @returns Localized human-readable status text
+ *
+ * @example
+ * getStatusText({
+ *   isPausing: false,
+ *   isTask: true,
+ *   taskStatus: "WAITING_FOR_SANDBOX",
+ *   taskDetail: null,
+ *   isStartingStatus: false,
+ *   isStopStatus: false,
+ *   curAgentState: AgentState.RUNNING
+ * }) // Returns "Waiting for sandbox"
+ */
+export function getStatusText({
+  isPausing = false,
+  isTask,
+  taskStatus,
+  taskDetail,
+  isStartingStatus,
+  isStopStatus,
+  curAgentState,
+  errorMessage,
+  t,
+}: GetStatusTextArgs): string {
+  // Show pausing status
+  if (isPausing) {
+    return t(I18nKey.COMMON$STOPPING);
+  }
+
+  // Show task status if we're polling a task
+  if (isTask && taskStatus) {
+    if (taskStatus === "ERROR") {
+      return taskDetail || t(I18nKey.CONVERSATION$ERROR_STARTING_CONVERSATION);
+    }
+
+    if (taskStatus === "READY") {
+      return t(I18nKey.CONVERSATION$READY);
+    }
+
+    // Format status text with sentence case: "WAITING_FOR_SANDBOX" -> "Waiting for sandbox"
+    return (
+      taskDetail ||
+      taskStatus
+        .toLowerCase()
+        .replace(/_/g, " ")
+        .replace(/^\w/, (c) => c.toUpperCase())
+    );
+  }
+
+  if (isStartingStatus) {
+    return t(I18nKey.COMMON$STARTING);
+  }
+
+  if (isStopStatus) {
+    return t(I18nKey.COMMON$SERVER_STOPPED);
+  }
+
+  if (curAgentState === AgentState.ERROR) {
+    return errorMessage || t(I18nKey.COMMON$ERROR);
+  }
+
+  return t(I18nKey.COMMON$RUNNING);
+}

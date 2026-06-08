@@ -1,75 +1,57 @@
 import React from "react";
-import { usePostHog } from "posthog-js/react";
 import { useParams } from "react-router";
 import { useTranslation } from "react-i18next";
 import { convertImageToBase64 } from "#/utils/convert-image-to-base-64";
-import { TrajectoryActions } from "../trajectory/trajectory-actions";
 import { createChatMessage } from "#/services/chat-service";
+import { BtwMessages } from "./btw-messages";
+import { ModelMessages } from "./model-messages";
 import { InteractiveChatBox } from "./interactive-chat-box";
 import { AgentState } from "#/types/agent-state";
-import { isOpenHandsAction, isActionOrObservation } from "#/types/core/guards";
-import { FeedbackModal } from "../feedback/feedback-modal";
+import { useFilteredEvents } from "#/hooks/use-filtered-events";
 import { useScrollToBottom } from "#/hooks/use-scroll-to-bottom";
 import { TypingIndicator } from "./typing-indicator";
-import { useWsClient } from "#/context/ws-client-provider";
-import { Messages as V0Messages } from "./messages";
 import { ChatSuggestions } from "./chat-suggestions";
 import { ScrollProvider } from "#/context/scroll-context";
-import { useInitialQueryStore } from "#/stores/initial-query-store";
 import { useSendMessage } from "#/hooks/use-send-message";
 import { useAgentState } from "#/hooks/use-agent-state";
+import { useHandleBuildPlanClick } from "#/hooks/use-handle-build-plan-click";
 
 import { ScrollToBottomButton } from "#/components/shared/buttons/scroll-to-bottom-button";
 import { LoadingSpinner } from "#/components/shared/loading-spinner";
+import { ChatMessagesSkeleton } from "./chat-messages-skeleton";
 import { displayErrorToast } from "#/utils/custom-toast-handlers";
 import { useErrorMessageStore } from "#/stores/error-message-store";
 import { useOptimisticUserMessageStore } from "#/stores/optimistic-user-message-store";
-import { useEventStore } from "#/stores/use-event-store";
 import { ErrorMessageBanner } from "./error-message-banner";
-import {
-  hasUserEvent,
-  shouldRenderEvent,
-} from "./event-content-helpers/should-render-event";
-import {
-  Messages as V1Messages,
-  hasUserEvent as hasV1UserEvent,
-  shouldRenderEvent as shouldRenderV1Event,
-} from "#/components/v1/chat";
+import { Messages as V1Messages } from "#/components/v1/chat";
 import { useUnifiedUploadFiles } from "#/hooks/mutation/use-unified-upload-files";
-import { useConfig } from "#/hooks/query/use-config";
 import { validateFiles } from "#/utils/file-validation";
-import { useConversationStore } from "#/state/conversation-store";
+import { useConversationStore } from "#/stores/conversation-store";
 import ConfirmationModeEnabled from "./confirmation-mode-enabled";
-import {
-  isV0Event,
-  isV1Event,
-  isSystemPromptEvent,
-  isConversationStateUpdateEvent,
-} from "#/types/v1/type-guards";
-import { useActiveConversation } from "#/hooks/query/use-active-conversation";
 import { useTaskPolling } from "#/hooks/query/use-task-polling";
 import { useConversationWebSocket } from "#/contexts/conversation-websocket-context";
-
-function getEntryPoint(
-  hasRepository: boolean | null,
-  hasReplayJson: boolean | null,
-): string {
-  if (hasRepository) return "github";
-  if (hasReplayJson) return "replay";
-  return "direct";
-}
+import ChatStatusIndicator from "./chat-status-indicator";
+import { getStatusColor, getStatusText } from "#/utils/utils";
+import { useNewConversationCommand } from "#/hooks/mutation/use-new-conversation-command";
+import { I18nKey } from "#/i18n/declaration";
+import { ArchivedBanner } from "./archived-banner";
+import { useModelStore } from "#/stores/model-store";
 
 export function ChatInterface() {
-  const posthog = usePostHog();
   const { setMessageToSend } = useConversationStore();
-  const { data: conversation } = useActiveConversation();
-  const { errorMessage } = useErrorMessageStore();
-  const { isLoadingMessages } = useWsClient();
-  const { isTask } = useTaskPolling();
+  const { errorMessage, removeErrorMessage } = useErrorMessageStore();
+  const { isTask, taskStatus, taskDetail } = useTaskPolling();
   const conversationWebSocket = useConversationWebSocket();
   const { send } = useSendMessage();
-  const storeEvents = useEventStore((state) => state.events);
-  const uiEvents = useEventStore((state) => state.uiEvents);
+  const {
+    v0Events,
+    v1UiEvents,
+    v1FullEvents,
+    totalEvents,
+    hasSubstantiveAgentActions,
+    v1UserEventsExist,
+    userEventsExist,
+  } = useFilteredEvents();
   const { setOptimisticUserMessage, getOptimisticUserMessage } =
     useOptimisticUserMessageStore();
   const { t } = useTranslation();
@@ -82,107 +64,95 @@ export function ChatInterface() {
     setAutoScroll,
     setHitBottom,
   } = useScrollToBottom(scrollRef);
-  const { data: config } = useConfig();
+  const {
+    mutate: newConversationCommand,
+    isPending: isNewConversationPending,
+  } = useNewConversationCommand();
 
-  const { curAgentState } = useAgentState();
+  const { curAgentState, isArchived } = useAgentState();
+  const { handleBuildPlanClick } = useHandleBuildPlanClick();
 
-  const [feedbackPolarity, setFeedbackPolarity] = React.useState<
-    "positive" | "negative"
-  >("positive");
-  const [feedbackModalIsOpen, setFeedbackModalIsOpen] = React.useState(false);
-  const { selectedRepository, replayJson } = useInitialQueryStore();
+  // Disable Build button while agent is running (streaming)
+  const isAgentRunning =
+    curAgentState === AgentState.RUNNING ||
+    curAgentState === AgentState.LOADING;
+
+  // Global keyboard shortcut for Build button (Cmd+Enter / Ctrl+Enter)
+  // This is placed here instead of PlanPreview to avoid duplicate listeners
+  // when multiple PlanPreview components exist in the chat
+  React.useEffect(() => {
+    if (isAgentRunning) {
+      return undefined;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // Check for Cmd+Enter (Mac) or Ctrl+Enter (Windows/Linux)
+      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+        event.preventDefault();
+        event.stopPropagation();
+        handleBuildPlanClick(event);
+        scrollDomToBottom();
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isAgentRunning, handleBuildPlanClick, scrollDomToBottom]);
+
   const params = useParams();
   const { mutateAsync: uploadFiles } = useUnifiedUploadFiles();
 
   const optimisticUserMessage = getOptimisticUserMessage();
-
-  const isV1Conversation = conversation?.conversation_version === "V1";
-
-  // Track when we should show V1 messages (after DOM has rendered)
-  const [showV1Messages, setShowV1Messages] = React.useState(false);
-  const prevV1LoadingRef = React.useRef(
-    conversationWebSocket?.isLoadingHistory,
+  const modelEntriesByConversation = useModelStore(
+    (s) => s.entriesByConversation,
   );
+  const modelEntriesCount =
+    (params.conversationId &&
+      modelEntriesByConversation[params.conversationId]?.length) ||
+    0;
+  const hasModelEntries = modelEntriesCount > 0;
 
-  // Wait for DOM to render before showing V1 messages
-  React.useEffect(() => {
-    const wasLoading = prevV1LoadingRef.current;
-    const isLoading = conversationWebSocket?.isLoadingHistory;
+  // Show V1 messages immediately if events exist in store (e.g., remount),
+  // or once loading completes. This replaces the old transition-observation
+  // pattern (useState + useEffect watching loading→loaded) which always showed
+  // skeleton on remount because local state initialized to false.
+  const showV1Messages =
+    v1FullEvents.length > 0 || !conversationWebSocket?.isLoadingHistory;
 
-    if (wasLoading && !isLoading) {
-      // Loading just finished - wait for next frame to ensure DOM is ready
-      requestAnimationFrame(() => {
-        setShowV1Messages(true);
-      });
-    } else if (isLoading) {
-      // Reset when loading starts
-      setShowV1Messages(false);
-    }
-
-    prevV1LoadingRef.current = isLoading;
-  }, [conversationWebSocket?.isLoadingHistory]);
-
-  // Filter V0 events
-  const v0Events = storeEvents
-    .filter(isV0Event)
-    .filter(isActionOrObservation)
-    .filter(shouldRenderEvent);
-
-  // Filter V1 events - use uiEvents for rendering (actions replaced by observations)
-  const v1UiEvents = uiEvents.filter(isV1Event).filter(shouldRenderV1Event);
-  // Keep full v1 events for lookups (includes both actions and observations)
-  const v1FullEvents = storeEvents.filter(isV1Event);
-
-  // Combined events count for tracking
-  const totalEvents = v0Events.length || v1UiEvents.length;
-
-  // Check if there are any substantive agent actions (not just system messages)
-  const hasSubstantiveAgentActions = React.useMemo(
-    () =>
-      storeEvents
-        .filter(isV0Event)
-        .filter(isActionOrObservation)
-        .some(
-          (event) =>
-            isOpenHandsAction(event) &&
-            event.source === "agent" &&
-            event.action !== "system",
-        ) ||
-      storeEvents
-        .filter(isV1Event)
-        .some(
-          (event) =>
-            event.source === "agent" &&
-            !isSystemPromptEvent(event) &&
-            !isConversationStateUpdateEvent(event),
-        ),
-    [storeEvents],
-  );
+  const isReturningToConversation = !!params.conversationId;
+  // Only show loading skeleton when genuinely loading AND no events in store yet.
+  // If events exist (e.g., remount after data was already fetched), skip skeleton.
+  const isHistoryLoading = !showV1Messages;
+  const isChatLoading = isHistoryLoading && !isTask;
 
   const handleSendMessage = async (
     content: string,
     originalImages: File[],
     originalFiles: File[],
   ) => {
+    // Handle /new command for V1 conversations
+    if (content.trim() === "/new") {
+      if (!params.conversationId) {
+        displayErrorToast(t(I18nKey.CONVERSATION$CLEAR_NO_ID));
+        return;
+      }
+      if (totalEvents === 0) {
+        displayErrorToast(t(I18nKey.CONVERSATION$CLEAR_EMPTY));
+        return;
+      }
+      if (isNewConversationPending) {
+        return;
+      }
+      newConversationCommand();
+      return;
+    }
+
     // Create mutable copies of the arrays
     const images = [...originalImages];
     const files = [...originalFiles];
-    if (totalEvents === 0) {
-      posthog.capture("initial_query_submitted", {
-        entry_point: getEntryPoint(
-          selectedRepository !== null,
-          replayJson !== null,
-        ),
-        query_character_length: content.length,
-        replay_json_size: replayJson?.length,
-      });
-    } else {
-      posthog.capture("user_message_sent", {
-        session_message_count: totalEvents,
-        current_message_length: content.length,
-      });
-    }
-
     // Validate file sizes before any processing
     const allFiles = [...images, ...files];
     const validation = validateFiles(allFiles);
@@ -208,17 +178,32 @@ export function ChatInterface() {
     const prompt =
       uploadedFiles.length > 0 ? `${content}\n\n${filePrompt}` : content;
 
-    send(createChatMessage(prompt, imageUrls, uploadedFiles, timestamp));
-    setOptimisticUserMessage(content);
+    const result = await send(
+      createChatMessage(prompt, imageUrls, uploadedFiles, timestamp),
+    );
+    // Only show optimistic UI if message was sent immediately via WebSocket
+    // If queued for later delivery, the message will appear when actually delivered
+    if (!result.queued) {
+      setOptimisticUserMessage(content);
+    }
     setMessageToSend("");
   };
 
-  const onClickShareFeedbackActionButton = async (
-    polarity: "positive" | "negative",
-  ) => {
-    setFeedbackModalIsOpen(true);
-    setFeedbackPolarity(polarity);
-  };
+  // Auto-scroll to bottom when new messages arrive
+  React.useEffect(() => {
+    if (autoScroll) {
+      scrollDomToBottom();
+    }
+    // Note: We intentionally exclude autoScroll from deps because we only want
+    // to scroll when message content changes, not when autoScroll state changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    v1UiEvents.length,
+    v0Events.length,
+    optimisticUserMessage,
+    modelEntriesCount,
+    scrollDomToBottom,
+  ]);
 
   // Create a ScrollProvider with the scroll hook values
   const scrollProviderValue = {
@@ -231,16 +216,39 @@ export function ChatInterface() {
     onChatBodyScroll,
   };
 
-  const v0UserEventsExist = hasUserEvent(v0Events);
-  const v1UserEventsExist = hasV1UserEvent(v1FullEvents);
-  const userEventsExist = v0UserEventsExist || v1UserEventsExist;
+  // Get server status indicator props
+  const isStartingStatus =
+    curAgentState === AgentState.LOADING || curAgentState === AgentState.INIT;
+  const isStopStatus = curAgentState === AgentState.STOPPED;
+  const isPausing = curAgentState === AgentState.PAUSED;
+  const serverStatusColor = getStatusColor({
+    isPausing,
+    isTask,
+    taskStatus,
+    isStartingStatus,
+    isStopStatus,
+    curAgentState,
+  });
+  const serverStatusText = getStatusText({
+    isPausing,
+    isTask,
+    taskStatus,
+    taskDetail,
+    isStartingStatus,
+    isStopStatus,
+    curAgentState,
+    errorMessage,
+    t,
+  });
 
   return (
     <ScrollProvider value={scrollProviderValue}>
       <div className="h-full flex flex-col justify-between pr-0 md:pr-4 relative">
         {!hasSubstantiveAgentActions &&
           !optimisticUserMessage &&
-          !userEventsExist && (
+          !userEventsExist &&
+          !isChatLoading &&
+          !hasModelEntries && (
             <ChatSuggestions
               onSuggestionsClick={(message) => setMessageToSend(message)}
             />
@@ -250,49 +258,36 @@ export function ChatInterface() {
         <div
           ref={scrollRef}
           onScroll={(e) => onChatBodyScroll(e.currentTarget)}
-          className="custom-scrollbar-always flex flex-col grow overflow-y-auto overflow-x-hidden px-4 pt-4 gap-2 fast-smooth-scroll"
+          className="custom-scrollbar-always flex flex-col grow overflow-y-auto overflow-x-hidden px-4 pt-4 gap-2"
         >
-          {isLoadingMessages && !isV1Conversation && !isTask && (
-            <div className="flex justify-center">
+          {isChatLoading && isReturningToConversation && (
+            <ChatMessagesSkeleton />
+          )}
+
+          {isChatLoading && !isReturningToConversation && (
+            <div className="flex justify-center" data-testid="loading-spinner">
               <LoadingSpinner size="small" />
             </div>
           )}
 
-          {(conversationWebSocket?.isLoadingHistory || !showV1Messages) &&
-            isV1Conversation &&
-            !isTask && (
-              <div className="flex justify-center">
-                <LoadingSpinner size="small" />
-              </div>
-            )}
-
-          {!isLoadingMessages && v0UserEventsExist && (
-            <V0Messages
-              messages={v0Events}
-              isAwaitingUserConfirmation={
-                curAgentState === AgentState.AWAITING_USER_CONFIRMATION
-              }
-            />
-          )}
-
+          <ModelMessages
+            conversationId={params.conversationId}
+            anchorEventId={null}
+          />
           {showV1Messages && v1UserEventsExist && (
             <V1Messages messages={v1UiEvents} allEvents={v1FullEvents} />
           )}
         </div>
 
         <div className="flex flex-col gap-[6px]">
+          <BtwMessages conversationId={params.conversationId} />
           <div className="flex justify-between relative">
-            <div className="flex items-center gap-1">
+            <div className="flex items-end gap-1">
               <ConfirmationModeEnabled />
-              {totalEvents > 0 && !isV1Conversation && (
-                <TrajectoryActions
-                  onPositiveFeedback={() =>
-                    onClickShareFeedbackActionButton("positive")
-                  }
-                  onNegativeFeedback={() =>
-                    onClickShareFeedbackActionButton("negative")
-                  }
-                  isSaasMode={config?.APP_MODE === "saas"}
+              {isStartingStatus && (
+                <ChatStatusIndicator
+                  statusColor={serverStatusColor}
+                  status={serverStatusText}
                 />
               )}
             </div>
@@ -304,18 +299,22 @@ export function ChatInterface() {
             {!hitBottom && <ScrollToBottomButton onClick={scrollDomToBottom} />}
           </div>
 
-          {errorMessage && <ErrorMessageBanner message={errorMessage} />}
+          {errorMessage && (
+            <ErrorMessageBanner
+              message={errorMessage}
+              onDismiss={removeErrorMessage}
+            />
+          )}
 
-          <InteractiveChatBox onSubmit={handleSendMessage} />
+          {isArchived && <ArchivedBanner />}
+
+          {!isArchived && (
+            <InteractiveChatBox
+              onSubmit={handleSendMessage}
+              disabled={isNewConversationPending}
+            />
+          )}
         </div>
-
-        {config?.APP_MODE !== "saas" && !isV1Conversation && (
-          <FeedbackModal
-            isOpen={feedbackModalIsOpen}
-            onClose={() => setFeedbackModalIsOpen(false)}
-            polarity={feedbackPolarity}
-          />
-        )}
       </div>
     </ScrollProvider>
   );

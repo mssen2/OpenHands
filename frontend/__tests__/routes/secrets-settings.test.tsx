@@ -1,16 +1,22 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { createRoutesStub, Outlet } from "react-router";
-import SecretsSettingsScreen from "#/routes/secrets-settings";
+import SecretsSettingsScreen, { clientLoader } from "#/routes/secrets-settings";
 import { SecretsService } from "#/api/secrets-service";
-import { GetSecretsResponse } from "#/api/secrets-service.types";
-import SettingsService from "#/settings-service/settings-service.api";
+import {
+  CustomSecretPage,
+  CustomSecretWithoutValue,
+} from "#/api/secrets-service.types";
+import SettingsService from "#/api/settings-service/settings-service.api";
 import OptionService from "#/api/option-service/option-service.api";
 import { MOCK_DEFAULT_USER_SETTINGS } from "#/mocks/handlers";
+import { OrganizationMember } from "#/types/org";
+import * as orgStore from "#/stores/selected-organization-store";
+import { organizationService } from "#/api/organization-service/organization-service.api";
 
-const MOCK_GET_SECRETS_RESPONSE: GetSecretsResponse["custom_secrets"] = [
+const MOCK_SECRETS: CustomSecretWithoutValue[] = [
   {
     name: "My_Secret_1",
     description: "My first secret",
@@ -21,25 +27,32 @@ const MOCK_GET_SECRETS_RESPONSE: GetSecretsResponse["custom_secrets"] = [
   },
 ];
 
-const RouterStub = createRoutesStub([
-  {
-    Component: () => <Outlet />,
-    path: "/settings",
-    children: [
-      {
-        Component: SecretsSettingsScreen,
-        path: "/settings/secrets",
-      },
-      {
-        Component: () => <div data-testid="git-settings-screen" />,
-        path: "/settings/integrations",
-      },
-    ],
-  },
-]);
+const createMockSecretsPage = (
+  secrets: CustomSecretWithoutValue[],
+): CustomSecretPage => ({
+  items: secrets,
+  next_page_id: null,
+});
 
-const renderSecretsSettings = () =>
-  render(<RouterStub initialEntries={["/settings/secrets"]} />, {
+const renderSecretsSettings = () => {
+  const RouterStub = createRoutesStub([
+    {
+      Component: () => <Outlet />,
+      path: "/settings",
+      children: [
+        {
+          Component: SecretsSettingsScreen,
+          path: "/settings/secrets",
+        },
+        {
+          Component: () => <div data-testid="git-settings-screen" />,
+          path: "/settings/integrations",
+        },
+      ],
+    },
+  ]);
+
+  return render(<RouterStub initialEntries={["/settings/secrets"]} />, {
     wrapper: ({ children }) => (
       <QueryClientProvider
         client={
@@ -52,12 +65,85 @@ const renderSecretsSettings = () =>
       </QueryClientProvider>
     ),
   });
+};
 
 beforeEach(() => {
   const getConfigSpy = vi.spyOn(OptionService, "getConfig");
   // @ts-expect-error - only return the config we need
   getConfigSpy.mockResolvedValue({
-    APP_MODE: "oss",
+    app_mode: "oss",
+  });
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("clientLoader permission checks", () => {
+  const createMockUser = (
+    overrides: Partial<OrganizationMember> = {},
+  ): OrganizationMember => ({
+    org_id: "org-1",
+    user_id: "user-1",
+    email: "test@example.com",
+    role: "member",
+    llm_api_key: "",
+    max_iterations: 100,
+    llm_model: "gpt-4",
+    llm_base_url: "",
+    status: "active",
+    ...overrides,
+  });
+
+  const seedActiveUser = (user: Partial<OrganizationMember>) => {
+    orgStore.useSelectedOrganizationStore.setState({ organizationId: "org-1" });
+    vi.spyOn(organizationService, "getMe").mockResolvedValue(
+      createMockUser(user),
+    );
+  };
+
+  it("should export a clientLoader for route protection", () => {
+    // This test verifies the clientLoader is exported (for consistency with other routes)
+    expect(clientLoader).toBeDefined();
+    expect(typeof clientLoader).toBe("function");
+  });
+
+  it("should allow members to access secrets settings (all roles have manage_secrets)", async () => {
+    // Arrange
+    seedActiveUser({ role: "member" });
+
+    const RouterStub = createRoutesStub([
+      {
+        Component: SecretsSettingsScreen,
+        loader: clientLoader,
+        path: "/settings/secrets",
+      },
+      {
+        Component: () => <div data-testid="user-settings-screen" />,
+        path: "/settings/user",
+      },
+    ]);
+
+    // Act
+    render(<RouterStub initialEntries={["/settings/secrets"]} />, {
+      wrapper: ({ children }) => (
+        <QueryClientProvider
+          client={
+            new QueryClient({
+              defaultOptions: { queries: { retry: false } },
+            })
+          }
+        >
+          {children}
+        </QueryClientProvider>
+      ),
+    });
+
+    // Assert - should stay on secrets settings page (not redirected)
+    await waitFor(() => {
+      expect(screen.getByTestId("secrets-settings-screen")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("user-settings-screen")).not.toBeInTheDocument();
   });
 });
 
@@ -70,10 +156,10 @@ describe("Content", () => {
   it("should NOT render a button to connect with git if they havent already in oss", async () => {
     const getConfigSpy = vi.spyOn(OptionService, "getConfig");
     const getSettingsSpy = vi.spyOn(SettingsService, "getSettings");
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
     // @ts-expect-error - only return the config we need
     getConfigSpy.mockResolvedValue({
-      APP_MODE: "oss",
+      app_mode: "oss",
     });
     getSettingsSpy.mockResolvedValue({
       ...MOCK_DEFAULT_USER_SETTINGS,
@@ -83,47 +169,51 @@ describe("Content", () => {
     renderSecretsSettings();
 
     expect(getConfigSpy).toHaveBeenCalled();
-    await waitFor(() => expect(getSecretsSpy).toHaveBeenCalled());
+    await waitFor(() => expect(searchSecretsSpy).toHaveBeenCalled());
     expect(screen.queryByTestId("connect-git-button")).not.toBeInTheDocument();
   });
 
   it("should render add secret button in saas mode", async () => {
     const getConfigSpy = vi.spyOn(OptionService, "getConfig");
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
     // @ts-expect-error - only return the config we need
     getConfigSpy.mockResolvedValue({
-      APP_MODE: "saas",
+      app_mode: "saas",
     });
 
     renderSecretsSettings();
 
-    // In SAAS mode, getSecrets is called and add secret button should be available
-    await waitFor(() => expect(getSecretsSpy).toHaveBeenCalled());
+    // In SAAS mode, searchSecrets is called and add secret button should be available
+    await waitFor(() => expect(searchSecretsSpy).toHaveBeenCalled());
     const button = await screen.findByTestId("add-secret-button");
     expect(button).toBeInTheDocument();
     expect(screen.queryByTestId("connect-git-button")).not.toBeInTheDocument();
   });
 
   it("should render an empty table when there are no existing secrets", async () => {
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
-    getSecretsSpy.mockResolvedValue([]);
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage([]));
     renderSecretsSettings();
 
     // Should show the add secret button
     await screen.findByTestId("add-secret-button");
 
+    // Wait for loading to complete and table headers to appear
+    await waitFor(() => {
+      expect(screen.getByText("SETTINGS$NAME")).toBeInTheDocument();
+    });
+
     // Should show an empty table with headers but no secret items
     expect(screen.queryAllByTestId("secret-item")).toHaveLength(0);
 
     // Should still show the table headers
-    expect(screen.getByText("SETTINGS$NAME")).toBeInTheDocument();
     expect(screen.getByText("SECRETS$DESCRIPTION")).toBeInTheDocument();
     expect(screen.getByText("SETTINGS$ACTIONS")).toBeInTheDocument();
   });
 
   it("should render existing secrets", async () => {
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
-    getSecretsSpy.mockResolvedValue(MOCK_GET_SECRETS_RESPONSE);
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage(MOCK_SECRETS));
     renderSecretsSettings();
 
     const secrets = await screen.findAllByTestId("secret-item");
@@ -134,7 +224,7 @@ describe("Content", () => {
 describe("Secret actions", () => {
   it("should create a new secret", async () => {
     const createSecretSpy = vi.spyOn(SecretsService, "createSecret");
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
     createSecretSpy.mockResolvedValue(true);
     renderSecretsSettings();
 
@@ -175,13 +265,13 @@ describe("Secret actions", () => {
 
     // hide form & render items
     expect(screen.queryByTestId("add-secret-form")).not.toBeInTheDocument();
-    expect(getSecretsSpy).toHaveBeenCalled();
+    expect(searchSecretsSpy).toHaveBeenCalled();
   });
 
   it("should edit a secret", async () => {
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
     const updateSecretSpy = vi.spyOn(SecretsService, "updateSecret");
-    getSecretsSpy.mockResolvedValue(MOCK_GET_SECRETS_RESPONSE);
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage(MOCK_SECRETS));
     updateSecretSpy.mockResolvedValue(true);
     renderSecretsSettings();
 
@@ -217,6 +307,13 @@ describe("Secret actions", () => {
     await userEvent.clear(descriptionInput);
     await userEvent.type(descriptionInput, "My edited secret description");
 
+    // Mock updated response for after edit
+    const updatedSecrets = [
+      { name: "My_Edited_Secret", description: "My edited secret description" },
+      MOCK_SECRETS[1],
+    ];
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage(updatedSecrets));
+
     await userEvent.click(submitButton);
 
     // make POST request
@@ -226,18 +323,20 @@ describe("Secret actions", () => {
       "My edited secret description",
     );
 
-    // hide form
-    expect(screen.queryByTestId("edit-secret-form")).not.toBeInTheDocument();
+    // hide form and show updated list
+    await waitFor(() => {
+      expect(screen.queryByTestId("edit-secret-form")).not.toBeInTheDocument();
+    });
 
-    // optimistic update
-    const updatedSecrets = await screen.findAllByTestId("secret-item");
-    expect(updatedSecrets).toHaveLength(2);
-    expect(updatedSecrets[0]).toHaveTextContent(/my_edited_secret/i);
+    // Wait for updated data after query invalidation
+    const secretsAfterEdit = await screen.findAllByTestId("secret-item");
+    expect(secretsAfterEdit).toHaveLength(2);
+    expect(secretsAfterEdit[0]).toHaveTextContent(/my_edited_secret/i);
   });
 
   it("should be able to cancel the create or edit form", async () => {
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
-    getSecretsSpy.mockResolvedValue(MOCK_GET_SECRETS_RESPONSE);
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage(MOCK_SECRETS));
     renderSecretsSettings();
 
     // render form & hide items
@@ -272,9 +371,9 @@ describe("Secret actions", () => {
   });
 
   it("should undo the optimistic update if the request fails", async () => {
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
     const updateSecretSpy = vi.spyOn(SecretsService, "updateSecret");
-    getSecretsSpy.mockResolvedValue(MOCK_GET_SECRETS_RESPONSE);
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage(MOCK_SECRETS));
     updateSecretSpy.mockRejectedValue(new Error("Failed to update secret"));
     renderSecretsSettings();
 
@@ -320,9 +419,9 @@ describe("Secret actions", () => {
   });
 
   it("should remove the secret from the list after deletion", async () => {
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
     const deleteSecretSpy = vi.spyOn(SecretsService, "deleteSecret");
-    getSecretsSpy.mockResolvedValue(MOCK_GET_SECRETS_RESPONSE);
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage(MOCK_SECRETS));
     deleteSecretSpy.mockResolvedValue(true);
     renderSecretsSettings();
 
@@ -336,21 +435,29 @@ describe("Secret actions", () => {
     const confirmationModal = screen.getByTestId("confirmation-modal");
     const confirmButton =
       within(confirmationModal).getByTestId("confirm-button");
+
+    // Mock updated response after deletion
+    searchSecretsSpy.mockResolvedValue(
+      createMockSecretsPage([MOCK_SECRETS[0]]),
+    );
+
     await userEvent.click(confirmButton);
 
     // make DELETE request
     expect(deleteSecretSpy).toHaveBeenCalledWith("My_Secret_2");
     expect(screen.queryByTestId("confirmation-modal")).not.toBeInTheDocument();
 
-    // optimistic update
-    expect(screen.queryAllByTestId("secret-item")).toHaveLength(1);
+    // Wait for updated list after query invalidation
+    await waitFor(() => {
+      expect(screen.queryAllByTestId("secret-item")).toHaveLength(1);
+    });
     expect(screen.queryByText("My_Secret_2")).not.toBeInTheDocument();
   });
 
   it("should be able to cancel the delete confirmation modal", async () => {
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
     const deleteSecretSpy = vi.spyOn(SecretsService, "deleteSecret");
-    getSecretsSpy.mockResolvedValue(MOCK_GET_SECRETS_RESPONSE);
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage(MOCK_SECRETS));
     deleteSecretSpy.mockResolvedValue(true);
     renderSecretsSettings();
 
@@ -372,9 +479,9 @@ describe("Secret actions", () => {
   });
 
   it("should revert the optimistic update if the request fails", async () => {
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
     const deleteSecretSpy = vi.spyOn(SecretsService, "deleteSecret");
-    getSecretsSpy.mockResolvedValue(MOCK_GET_SECRETS_RESPONSE);
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage(MOCK_SECRETS));
     deleteSecretSpy.mockRejectedValue(new Error("Failed to delete secret"));
     renderSecretsSettings();
 
@@ -400,13 +507,15 @@ describe("Secret actions", () => {
   });
 
   it("should hide the table and add button when in form view", async () => {
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
-    getSecretsSpy.mockResolvedValue([]);
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage([]));
     renderSecretsSettings();
 
-    // Initially should show the add button and table
+    // Initially should show the add button and wait for table to load
     const button = await screen.findByTestId("add-secret-button");
-    expect(screen.getByText("SETTINGS$NAME")).toBeInTheDocument(); // table header
+    await waitFor(() => {
+      expect(screen.getByText("SETTINGS$NAME")).toBeInTheDocument(); // table header
+    });
 
     await userEvent.click(button);
 
@@ -454,8 +563,8 @@ describe("Secret actions", () => {
 
   it("should not allow existing secret names", async () => {
     const createSecretSpy = vi.spyOn(SecretsService, "createSecret");
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
-    getSecretsSpy.mockResolvedValue(MOCK_GET_SECRETS_RESPONSE.slice(0, 1));
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage(MOCK_SECRETS.slice(0, 1)));
     renderSecretsSettings();
 
     // render form & hide items
@@ -501,6 +610,8 @@ describe("Secret actions", () => {
 
   it("should not submit whitespace secret names or values", async () => {
     const createSecretSpy = vi.spyOn(SecretsService, "createSecret");
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage([]));
     renderSecretsSettings();
 
     // render form & hide items
@@ -532,15 +643,17 @@ describe("Secret actions", () => {
     await userEvent.click(submitButton);
 
     expect(createSecretSpy).not.toHaveBeenCalled();
-    expect(
-      screen.queryByText("SECRETS$SECRET_VALUE_REQUIRED"),
-    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        screen.queryByText("SECRETS$SECRET_VALUE_REQUIRED"),
+      ).toBeInTheDocument();
+    });
   });
 
   it("should not reset ipout values on an invalid submit", async () => {
-    const getSecretsSpy = vi.spyOn(SecretsService, "getSecrets");
+    const searchSecretsSpy = vi.spyOn(SecretsService, "searchSecrets");
     const createSecretSpy = vi.spyOn(SecretsService, "createSecret");
-    getSecretsSpy.mockResolvedValue(MOCK_GET_SECRETS_RESPONSE);
+    searchSecretsSpy.mockResolvedValue(createMockSecretsPage(MOCK_SECRETS));
 
     renderSecretsSettings();
 
@@ -557,7 +670,7 @@ describe("Secret actions", () => {
     const valueInput = within(secretForm).getByTestId("value-input");
     const submitButton = within(secretForm).getByTestId("submit-button");
 
-    await userEvent.type(nameInput, MOCK_GET_SECRETS_RESPONSE[0].name);
+    await userEvent.type(nameInput, MOCK_SECRETS[0].name);
     await userEvent.type(valueInput, "my-custom-secret-value");
     await userEvent.click(submitButton);
 
@@ -567,7 +680,7 @@ describe("Secret actions", () => {
       screen.queryByText("SECRETS$SECRET_ALREADY_EXISTS"),
     ).toBeInTheDocument();
 
-    expect(nameInput).toHaveValue(MOCK_GET_SECRETS_RESPONSE[0].name);
+    expect(nameInput).toHaveValue(MOCK_SECRETS[0].name);
     expect(valueInput).toHaveValue("my-custom-secret-value");
   });
 });

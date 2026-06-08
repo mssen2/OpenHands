@@ -54,8 +54,8 @@ export function IntegrationRow({
     linkMutation.mutate(workspace);
   };
 
-  const handleUnlink = () => {
-    unlinkMutation.mutate();
+  const handleUnlink = (adminApiKey?: string) => {
+    unlinkMutation.mutate(adminApiKey);
   };
 
   const handleConfigureConfirm = (data: {
@@ -63,6 +63,7 @@ export function IntegrationRow({
     webhookSecret: string;
     serviceAccountEmail: string;
     serviceAccountApiKey: string;
+    adminApiKey: string;
     isActive: boolean;
   }) => {
     configureMutation.mutate(data);
@@ -85,7 +86,10 @@ export function IntegrationRow({
       : t(I18nKey.PROJECT_MANAGEMENT$CONFIGURE_BUTTON_LABEL);
 
   return (
-    <div className="flex items-center justify-between" data-testid={dataTestId}>
+    <div
+      className="flex items-center justify-between flex-wrap gap-2"
+      data-testid={dataTestId}
+    >
       <span className="font-medium">{platformName}</span>
       <div className="flex items-center gap-6">
         <ConfigureButton

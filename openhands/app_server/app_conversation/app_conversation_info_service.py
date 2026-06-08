@@ -9,6 +9,7 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     AppConversationSortOrder,
 )
 from openhands.app_server.services.injector import Injector
+from openhands.sdk.event import ConversationStateUpdateEvent
 from openhands.sdk.utils.models import DiscriminatedUnionMixin
 
 
@@ -23,6 +24,7 @@ class AppConversationInfoService(ABC):
         created_at__lt: datetime | None = None,
         updated_at__gte: datetime | None = None,
         updated_at__lt: datetime | None = None,
+        sandbox_id__eq: str | None = None,
         sort_order: AppConversationSortOrder = AppConversationSortOrder.CREATED_AT_DESC,
         page_id: str | None = None,
         limit: int = 100,
@@ -38,6 +40,7 @@ class AppConversationInfoService(ABC):
         created_at__lt: datetime | None = None,
         updated_at__gte: datetime | None = None,
         updated_at__lt: datetime | None = None,
+        sandbox_id__eq: str | None = None,
     ) -> int:
         """Count sandboxed conversations."""
 
@@ -81,6 +84,14 @@ class AppConversationInfoService(ABC):
             List of sub-conversation IDs
         """
 
+    @abstractmethod
+    async def count_conversations_by_sandbox_id(self, sandbox_id: str) -> int:
+        """Count V1 conversations that reference the given sandbox.
+
+        Used to decide whether a sandbox can be safely deleted when a
+        conversation is removed (only delete if count is 0).
+        """
+
     # Mutators
 
     @abstractmethod
@@ -90,6 +101,19 @@ class AppConversationInfoService(ABC):
         """Store the sandboxed conversation info object given.
 
         Return the stored info
+        """
+
+    @abstractmethod
+    async def process_stats_event(
+        self,
+        event: ConversationStateUpdateEvent,
+        conversation_id: UUID,
+    ) -> None:
+        """Process a stats event and update conversation statistics.
+
+        Args:
+            event: The ConversationStateUpdateEvent with key='stats'
+            conversation_id: The ID of the conversation to update
         """
 
 

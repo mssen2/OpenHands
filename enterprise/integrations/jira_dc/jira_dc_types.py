@@ -5,7 +5,7 @@ from jinja2 import Environment
 from storage.jira_dc_user import JiraDcUser
 from storage.jira_dc_workspace import JiraDcWorkspace
 
-from openhands.server.user_auth.user_auth import UserAuth
+from openhands.app_server.user_auth.user_auth import UserAuth
 
 
 class JiraDcViewInterface(ABC):
@@ -19,7 +19,7 @@ class JiraDcViewInterface(ABC):
     conversation_id: str
 
     @abstractmethod
-    def _get_instructions(self, jinja_env: Environment) -> tuple[str, str]:
+    async def _get_instructions(self, jinja_env: Environment) -> tuple[str, str]:
         """Get initial instructions for the conversation."""
         pass
 

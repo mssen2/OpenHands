@@ -18,7 +18,8 @@ import {
   renderConversationErroredToast,
   renderConversationCreatedToast,
   renderConversationFinishedToast,
-} from "#/components/features/chat/microagent/microagent-status-toast";
+} from "#/components/shared/conversation-toast";
+import { Provider } from "#/types/settings";
 
 interface ConversationSocket {
   socket: Socket;
@@ -31,7 +32,7 @@ interface ConversationSubscriptionsContextType {
   subscribeToConversation: (options: {
     conversationId: string;
     sessionApiKey: string | null;
-    providersSet: ("github" | "gitlab" | "bitbucket" | "enterprise_sso")[];
+    providersSet: Provider[];
     baseUrl: string;
     socketPath?: string;
     onEvent?: (event: unknown, conversationId: string) => void;
@@ -135,7 +136,7 @@ export function ConversationSubscriptionsProvider({
     (options: {
       conversationId: string;
       sessionApiKey: string | null;
-      providersSet: ("github" | "gitlab" | "bitbucket" | "enterprise_sso")[];
+      providersSet: Provider[];
       baseUrl: string;
       socketPath?: string;
       onEvent?: (event: unknown, conversationId: string) => void;
@@ -184,14 +185,14 @@ export function ConversationSubscriptionsProvider({
           );
         } else if (isStatusUpdate(event)) {
           if (event.type === "info" && event.id === "STATUS$STARTING_RUNTIME") {
-            renderConversationCreatedToast(conversationId);
+            renderConversationCreatedToast();
           }
         } else if (
           isOpenHandsEvent(event) &&
           isAgentStateChangeObservation(event)
         ) {
           if (event.extras.agent_state === AgentState.FINISHED) {
-            renderConversationFinishedToast(conversationId);
+            renderConversationFinishedToast();
             unsubscribeFromConversation(conversationId);
           }
         }

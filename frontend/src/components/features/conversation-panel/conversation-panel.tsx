@@ -15,8 +15,11 @@ import { useClickOutsideElement } from "#/hooks/use-click-outside-element";
 import { Provider } from "#/types/settings";
 import { useUpdateConversation } from "#/hooks/mutation/use-update-conversation";
 import { displaySuccessToast } from "#/utils/custom-toast-handlers";
+import { agentDisplayLabel } from "#/utils/agent-display-label";
+import { useConfig } from "#/hooks/query/use-config";
 import { ConversationCard } from "./conversation-card/conversation-card";
 import { StartTaskCard } from "./start-task-card/start-task-card";
+import { ConversationCardSkeleton } from "./conversation-card/conversation-card-skeleton";
 
 interface ConversationPanelProps {
   onClose: () => void;
@@ -27,6 +30,7 @@ export function ConversationPanel({ onClose }: ConversationPanelProps) {
   const { conversationId: currentConversationId } = useParams();
   const ref = useClickOutsideElement<HTMLDivElement>(onClose);
   const navigate = useNavigate();
+  const { data: config } = useConfig();
 
   const [confirmDeleteModalVisible, setConfirmDeleteModalVisible] =
     React.useState(false);
@@ -39,8 +43,11 @@ export function ConversationPanel({ onClose }: ConversationPanelProps) {
   const [selectedConversationId, setSelectedConversationId] = React.useState<
     string | null
   >(null);
-  const [selectedConversationVersion, setSelectedConversationVersion] =
-    React.useState<"V0" | "V1" | undefined>(undefined);
+  const [selectedConversationTitle, setSelectedConversationTitle] =
+    React.useState<string | null>(null);
+  const [selectedSandboxId, setSelectedSandboxId] = React.useState<
+    string | null
+  >(null);
   const [openContextMenuId, setOpenContextMenuId] = React.useState<
     string | null
   >(null);
@@ -57,8 +64,8 @@ export function ConversationPanel({ onClose }: ConversationPanelProps) {
   // Fetch in-progress start tasks
   const { data: startTasks } = useStartTasks();
 
-  // Flatten all pages into a single array of conversations
-  const conversations = data?.pages.flatMap((page) => page.results) ?? [];
+  // Flatten all pages into a single array of conversations (V1 uses 'items' instead of 'results')
+  const conversations = data?.pages.flatMap((page) => page.items) ?? [];
 
   const { mutate: deleteConversation } = useDeleteConversation();
   const { mutate: pauseConversationSandbox } =
@@ -73,18 +80,19 @@ export function ConversationPanel({ onClose }: ConversationPanelProps) {
     threshold: 200, // Load more when 200px from bottom
   });
 
-  const handleDeleteProject = (conversationId: string) => {
+  const handleDeleteProject = (conversationId: string, title: string) => {
     setConfirmDeleteModalVisible(true);
     setSelectedConversationId(conversationId);
+    setSelectedConversationTitle(title);
   };
 
   const handleStopConversation = (
     conversationId: string,
-    version?: "V0" | "V1",
+    sandboxId?: string | null,
   ) => {
     setConfirmStopModalVisible(true);
     setSelectedConversationId(conversationId);
-    setSelectedConversationVersion(version);
+    setSelectedSandboxId(sandboxId ?? null);
   };
 
   const handleConversationTitleChange = async (
@@ -120,7 +128,6 @@ export function ConversationPanel({ onClose }: ConversationPanelProps) {
     if (selectedConversationId) {
       pauseConversationSandbox({
         conversationId: selectedConversationId,
-        version: selectedConversationVersion,
       });
     }
   };
@@ -137,10 +144,13 @@ export function ConversationPanel({ onClose }: ConversationPanelProps) {
       className="w-full md:w-[400px] h-full border border-[#525252] bg-[#25272D] rounded-lg overflow-y-auto absolute custom-scrollbar-always"
     >
       {isFetching && conversations.length === 0 && (
-        <div className="w-full h-full absolute flex justify-center items-center">
-          <LoadingSpinner size="small" />
+        <div className="space-y-2">
+          {Array.from({ length: 5 }).map((_, index) => (
+            <ConversationCardSkeleton key={index} />
+          ))}
         </div>
       )}
+
       {error && (
         <div className="flex flex-col items-center justify-center h-full">
           <p className="text-danger">{error.message}</p>
@@ -164,38 +174,42 @@ export function ConversationPanel({ onClose }: ConversationPanelProps) {
         </NavLink>
       ))}
       {/* Then render completed conversations */}
-      {conversations?.map((project) => (
+      {conversations?.map((conversation) => (
         <NavLink
-          key={project.conversation_id}
-          to={`/conversations/${project.conversation_id}`}
+          key={conversation.id}
+          to={`/conversations/${conversation.id}`}
           onClick={onClose}
         >
           <ConversationCard
-            onDelete={() => handleDeleteProject(project.conversation_id)}
+            onDelete={() =>
+              handleDeleteProject(conversation.id, conversation.title ?? "")
+            }
             onStop={() =>
-              handleStopConversation(
-                project.conversation_id,
-                project.conversation_version,
-              )
+              handleStopConversation(conversation.id, conversation.sandbox_id)
             }
             onChangeTitle={(title) =>
-              handleConversationTitleChange(project.conversation_id, title)
+              handleConversationTitleChange(conversation.id, title)
             }
-            title={project.title}
+            title={conversation.title ?? ""}
             selectedRepository={{
-              selected_repository: project.selected_repository,
-              selected_branch: project.selected_branch,
-              git_provider: project.git_provider as Provider,
+              selected_repository: conversation.selected_repository,
+              selected_branch: conversation.selected_branch,
+              git_provider: conversation.git_provider as Provider,
             }}
-            lastUpdatedAt={project.last_updated_at}
-            createdAt={project.created_at}
-            conversationStatus={project.status}
-            conversationId={project.conversation_id}
-            conversationVersion={project.conversation_version}
-            contextMenuOpen={openContextMenuId === project.conversation_id}
+            lastUpdatedAt={conversation.updated_at}
+            createdAt={conversation.created_at}
+            sandboxStatus={conversation.sandbox_status}
+            conversationId={conversation.id}
+            contextMenuOpen={openContextMenuId === conversation.id}
             onContextMenuToggle={(isOpen) =>
-              setOpenContextMenuId(isOpen ? project.conversation_id : null)
+              setOpenContextMenuId(isOpen ? conversation.id : null)
             }
+            llmModel={agentDisplayLabel(
+              conversation.agent_kind,
+              conversation.llm_model,
+              conversation.tags,
+              config?.acp_providers,
+            )}
           />
         </NavLink>
       ))}
@@ -212,8 +226,13 @@ export function ConversationPanel({ onClose }: ConversationPanelProps) {
           onConfirm={() => {
             handleConfirmDelete();
             setConfirmDeleteModalVisible(false);
+            setSelectedConversationTitle(null);
           }}
-          onCancel={() => setConfirmDeleteModalVisible(false)}
+          onCancel={() => {
+            setConfirmDeleteModalVisible(false);
+            setSelectedConversationTitle(null);
+          }}
+          conversationTitle={selectedConversationTitle ?? undefined}
         />
       )}
 
@@ -224,6 +243,7 @@ export function ConversationPanel({ onClose }: ConversationPanelProps) {
             setConfirmStopModalVisible(false);
           }}
           onCancel={() => setConfirmStopModalVisible(false)}
+          sandboxId={selectedSandboxId}
         />
       )}
 
@@ -233,6 +253,7 @@ export function ConversationPanel({ onClose }: ConversationPanelProps) {
             onClose();
           }}
           onClose={() => setConfirmExitConversationModalVisible(false)}
+          onCancel={() => setConfirmExitConversationModalVisible(false)}
         />
       )}
     </div>

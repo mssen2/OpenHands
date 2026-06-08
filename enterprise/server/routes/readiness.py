@@ -1,19 +1,19 @@
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy.sql import text
-from storage.database import session_maker
-from storage.redis import create_redis_client
+from storage.database import a_session_maker
+from storage.redis import get_redis_client
 
-from openhands.core.logger import openhands_logger as logger
+from openhands.app_server.utils.logger import openhands_logger as logger
 
 readiness_router = APIRouter()
 
 
 @readiness_router.get('/ready')
-def is_ready():
+async def is_ready():
     # Check database connection
     try:
-        with session_maker() as session:
-            session.execute(text('SELECT 1'))
+        async with a_session_maker() as session:
+            await session.execute(text('SELECT 1'))
     except Exception as e:
         logger.error(f'Database check failed: {str(e)}')
         raise HTTPException(
@@ -23,7 +23,7 @@ def is_ready():
 
     # Check Redis connection
     try:
-        redis_client = create_redis_client()
+        redis_client = get_redis_client()
         redis_client.ping()
     except Exception as e:
         logger.error(f'Redis check failed: {str(e)}')

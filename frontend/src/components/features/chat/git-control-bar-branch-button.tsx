@@ -4,6 +4,7 @@ import { constructBranchUrl, cn } from "#/utils/utils";
 import { Provider } from "#/types/settings";
 import { I18nKey } from "#/i18n/declaration";
 import { GitExternalLinkIcon } from "./git-external-link-icon";
+import { useProviderHost } from "#/hooks/use-provider-host";
 
 interface GitControlBarBranchButtonProps {
   selectedBranch: string | null | undefined;
@@ -17,10 +18,16 @@ export function GitControlBarBranchButton({
   gitProvider,
 }: GitControlBarBranchButtonProps) {
   const { t } = useTranslation();
+  const providerHost = useProviderHost(gitProvider);
 
   const hasBranch = selectedBranch && selectedRepository && gitProvider;
   const branchUrl = hasBranch
-    ? constructBranchUrl(gitProvider, selectedRepository, selectedBranch)
+    ? constructBranchUrl(
+        gitProvider,
+        selectedRepository,
+        selectedBranch,
+        providerHost,
+      )
     : undefined;
 
   const buttonText = hasBranch ? selectedBranch : t(I18nKey.COMMON$NO_BRANCH);

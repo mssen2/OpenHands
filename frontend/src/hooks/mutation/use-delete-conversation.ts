@@ -1,12 +1,13 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import ConversationService from "#/api/conversation-service/conversation-service.api";
+import V1ConversationService from "#/api/conversation-service/v1-conversation-service.api";
+import { clearConversationLocalStorage } from "#/utils/conversation-local-storage";
 
 export const useDeleteConversation = () => {
   const queryClient = useQueryClient();
 
   return useMutation({
     mutationFn: (variables: { conversationId: string }) =>
-      ConversationService.deleteUserConversation(variables.conversationId),
+      V1ConversationService.deleteConversation(variables.conversationId),
     onMutate: async (variables) => {
       await queryClient.cancelQueries({ queryKey: ["user", "conversations"] });
       const previousConversations = queryClient.getQueryData([
@@ -24,6 +25,11 @@ export const useDeleteConversation = () => {
 
       return { previousConversations };
     },
+
+    onSuccess: (_, variables) => {
+      clearConversationLocalStorage(variables.conversationId);
+    },
+
     onError: (err, variables, context) => {
       if (context?.previousConversations) {
         queryClient.setQueryData(

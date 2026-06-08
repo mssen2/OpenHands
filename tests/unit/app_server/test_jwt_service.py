@@ -3,17 +3,22 @@
 This module tests the JWT service functionality including:
 - JWS token creation and verification (sign/verify round trip)
 - JWE token creation and decryption (encrypt/decrypt round trip)
+- Symmetric encrypt/decrypt helpers (JWE + legacy Fernet fallback)
 - Key management and rotation
 - Error handling and edge cases
 """
 
+import hashlib
 import json
+from base64 import b64encode
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import jwt
 import pytest
-from jose import jwe
+from cryptography.fernet import Fernet
+from joserfc import jwe
+from joserfc.jwk import OctKey
 from pydantic import SecretStr
 
 from openhands.app_server.services.jwt_service import JwtService
@@ -156,15 +161,25 @@ class TestJwtService:
         with pytest.raises(ValueError, match='Invalid JWT token format'):
             jwt_service.verify_jws_token('invalid.token')
 
-    def test_jws_token_verification_no_kid_header(self, jwt_service):
-        """Test JWS token verification fails when token has no kid header."""
-        # Create a token without kid header using PyJWT directly
+    def test_jws_token_verification_no_kid_header_falls_back_to_default_key(
+        self, jwt_service, sample_keys
+    ):
+        """Test JWS token verification uses default key when token has no kid header."""
+        # Create a token without kid header using PyJWT directly,
+        # signed with the default key's secret (key2 is newest active).
+        default_secret = sample_keys[1].key.get_secret_value()
         payload = {'user_id': '123'}
-        token = jwt.encode(payload, 'some_secret', algorithm='HS256')
+        token = jwt.encode(payload, default_secret, algorithm='HS256')
 
-        with pytest.raises(
-            ValueError, match="Token does not contain 'kid' header with key ID"
-        ):
+        decoded = jwt_service.verify_jws_token(token)
+        assert decoded['user_id'] == '123'
+
+    def test_jws_token_verification_no_kid_header_wrong_secret(self, jwt_service):
+        """Test JWS verification fails for no-kid token signed with wrong secret."""
+        payload = {'user_id': '123'}
+        token = jwt.encode(payload, 'totally_wrong_secret', algorithm='HS256')
+
+        with pytest.raises(jwt.InvalidTokenError, match='Token verification failed'):
             jwt_service.verify_jws_token(token)
 
     def test_jws_token_verification_wrong_signature(self, jwt_service):
@@ -199,9 +214,8 @@ class TestJwtService:
 
         # Check that standard JWT claims are added
         assert 'iat' in decrypted_payload
-        assert 'exp' in decrypted_payload
+        assert 'exp' not in decrypted_payload
         assert isinstance(decrypted_payload['iat'], int)  # JWE uses timestamp integers
-        assert isinstance(decrypted_payload['exp'], int)
 
     def test_jwe_token_round_trip_specific_key(self, jwt_service):
         """Test JWE token creation and decryption with specific key."""
@@ -258,16 +272,21 @@ class TestJwtService:
 
     def test_jwe_token_decryption_no_kid_header(self, jwt_service):
         """Test JWE token decryption fails when token has no kid header."""
-        # Create a JWE token without kid header using python-jose directly
-        payload = {'user_id': '123'}
-        # Create a proper 32-byte key for A256GCM
-        key = b'12345678901234567890123456789012'  # Exactly 32 bytes
+        # Create a JWE token without kid header using joserfc directly
+        key_bytes = b'12345678901234567890123456789012'  # Exactly 32 bytes
+        symmetric_key = OctKey.import_key(key_bytes)
 
-        token = jwe.encrypt(
-            json.dumps(payload), key, algorithm='dir', encryption='A256GCM'
+        registry = jwe.JWERegistry(algorithms=['dir', 'A256GCM'])
+        payload = json.dumps({'user_id': '123'}).encode('utf-8')
+        # Create JWE token without kid in protected header
+        token = jwe.encrypt_compact(
+            {'alg': 'dir', 'enc': 'A256GCM'},
+            payload,
+            symmetric_key,
+            registry=registry,
         )
 
-        with pytest.raises(ValueError, match='Invalid JWE token format'):
+        with pytest.raises(ValueError, match="Token does not contain 'kid' header"):
             jwt_service.decrypt_jwe_token(token)
 
     def test_jwe_token_decryption_wrong_key(self, jwt_service):
@@ -420,7 +439,7 @@ class TestJwtService:
 
         # Should still have standard claims
         assert 'iat' in jwe_decrypted
-        assert 'exp' in jwe_decrypted
+        assert 'exp' not in jwe_decrypted
 
     def test_unicode_and_special_characters(self, jwt_service):
         """Test JWS and JWE with unicode and special characters."""
@@ -445,3 +464,196 @@ class TestJwtService:
 
         for key, value in unicode_payload.items():
             assert jwe_decrypted[key] == value
+
+    def test_jwe_backwards_compatibility_with_python_jose_tokens(self, jwt_service):
+        """Test that JWE tokens created with python-jose can be decrypted.
+
+        These tokens were generated using python-jose with the same key
+        derivation used by jwt_service (SHA256 of the secret key).
+
+        The tokens use:
+        - Algorithm: dir (direct encryption)
+        - Encryption: A256GCM
+        - Key: SHA256 hash of 'test_secret_key_1' (matches key1 fixture)
+        """
+        # Token with simple payload: {"user_id": "123", "role": "admin", "iat": 1704067200}
+        simple_token = (
+            'eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoia2V5MSJ9'
+            '..NJs9xezbNx3va7Q1.I7FvCODEX_cnrB7qmAVkxFaNET89ZoEVo9Enp33plE7jeBJObPGPzWLjEg-khlzeggyUa_7u'
+            '.TmGNAVzMIIl4dbMB5NfyGg'
+        )
+
+        # Token with complex nested payload
+        complex_token = (
+            'eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoia2V5MSJ9'
+            '..trjTZoGEg_mBSE3r.-o5RbtSnF_cacNnWQ_z4LGzA1FKfo5OFetjJzvgEAOe0z7DOvzAURIkUwhgKGWM55HEqRGrH'
+            'KrIvdNi8-VeWA0p0-bbX0rHHSK4qN1pRfMAbm7ftQ5tl-UMnG52z5D8aFZM6JRGz5loynqo__lx2onSb87t84tcpvK'
+            'yteyu7vnoqKxDUw0iK-TwQGg12jz0a1PgHneCqdE8.wzWMxLkkPv7O3dbkrrNraw'
+        )
+
+        # Token with unicode characters in payload
+        unicode_token = (
+            'eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoia2V5MSJ9'
+            '..y5Ez0HSrowxdufK5.Egv1ApEVRg-O5RN8GKj1K-1jLA9DZVQrx2vc7a0lkZkW4FQ3PtEMym3UXClIpbIiO4zLrd1U'
+            'cq3sBaBqAhand4hYXte1GvANBqtn59mAoyEZz_w1dFQJQfUYvXrphf2ZjrRC6GuVILsUncK1Kyttc_E0hfnaet6vOU'
+            '3MCrGueR1LQNhg7SZo8eXyEDoPfqgXBEpM9OInMg.AiGz8aLdIPUZ__OkezpkmA'
+        )
+
+        # Test simple token decryption
+        simple_decrypted = jwt_service.decrypt_jwe_token(simple_token)
+        assert simple_decrypted['user_id'] == '123'
+        assert simple_decrypted['role'] == 'admin'
+        assert simple_decrypted['iat'] == 1704067200
+
+        # Test complex token decryption with nested structures
+        complex_decrypted = jwt_service.decrypt_jwe_token(complex_token)
+        assert complex_decrypted['user_id'] == 'user123'
+        assert complex_decrypted['metadata']['permissions'] == [
+            'read',
+            'write',
+            'admin',
+        ]
+        assert complex_decrypted['metadata']['settings']['theme'] == 'dark'
+        assert complex_decrypted['metadata']['settings']['notifications'] is True
+        assert complex_decrypted['iat'] == 1704067200
+
+        # Test unicode token decryption
+        unicode_decrypted = jwt_service.decrypt_jwe_token(unicode_token)
+        assert unicode_decrypted['user_name'] == 'José María'
+        assert unicode_decrypted['description'] == 'Testing with émojis 🚀'
+        assert unicode_decrypted['chinese'] == '你好世界'
+        assert unicode_decrypted['iat'] == 1704067200
+
+    def test_jwe_backwards_compatibility_with_jwcrypto_tokens(self, jwt_service):
+        """Test that JWE tokens created with jwcrypto can be decrypted.
+
+        These tokens were generated using jwcrypto 1.5.7 with the same key
+        derivation used by jwt_service (SHA256 of the secret key).
+
+        The tokens use:
+        - Algorithm: dir (direct encryption)
+        - Encryption: A256GCM
+        - Key: SHA256 hash of 'test_secret_key_1' (matches key1 fixture)
+        """
+        # Token with simple payload: {"user_id": "123", "role": "admin", "iat": 1704067200}
+        simple_token = (
+            'eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoia2V5MSJ9'
+            '..JzJ3SzPJHPQYg2rR.Mw8WFhpTtsnplJkhcOROeRQ4ua_Vw1TL2arkj-7iNybgXJMnKGkq'
+            'VMnDbOJ_zQe3fSsXOzsk'
+            '.OWtgVC_5JvmZvX55EGafKA'
+        )
+
+        # Token with complex nested payload
+        complex_token = (
+            'eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoia2V5MSJ9'
+            '..b0ZupYA2WHYjomKb.aZuLSB_Vdzo4cTq8EG7It00c5-1h-LaxdGYBHqiHAwiig89lmpKX'
+            'NleshC6EfHSxv4FtqG79mQFIkjpTIyJs11qBw8xCJiyAoQVp5Czi_UrclKEkYvRkxNjJyf1'
+            'j2ASa-amsOaz7edKyhrzzdEeD0ZJa2MQFVOr5IcHvv3XH5ixKORcga0FXRjqvwyJVdFUlD71'
+            'y-1pdrns'
+            '.2ZThusOVDIpQWS_tykcAuA'
+        )
+
+        # Token with unicode characters in payload
+        unicode_token = (
+            'eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoia2V5MSJ9'
+            '..BHHa6cYZeglEHZAQ.sdR_NlK-aIBg-OtAtTVfiT7NFdXl2K6DjeWvAoYwcBLrlujEaEo7'
+            'Bb9AkZMwIJAVBDpJDqGVz0gvQSot6DHrURVMG4ba0Pp8I8OKb3gMoK0ylyqpMWBcQ-myMhj'
+            'ikqa_47RK1zF6zmHPOp4IoFPyQtm0n8tYHoKfpp4yvjY5qXnDvCFUbrm27ETKGr_Bg03ijop'
+            'LnF2XoQ'
+            '.Vt7AWibpWpgDD3va_zdLbQ'
+        )
+
+        # Test simple token decryption
+        simple_decrypted = jwt_service.decrypt_jwe_token(simple_token)
+        assert simple_decrypted['user_id'] == '123'
+        assert simple_decrypted['role'] == 'admin'
+        assert simple_decrypted['iat'] == 1704067200
+
+        # Test complex token decryption with nested structures
+        complex_decrypted = jwt_service.decrypt_jwe_token(complex_token)
+        assert complex_decrypted['user_id'] == 'user123'
+        assert complex_decrypted['metadata']['permissions'] == [
+            'read',
+            'write',
+            'admin',
+        ]
+        assert complex_decrypted['metadata']['settings']['theme'] == 'dark'
+        assert complex_decrypted['metadata']['settings']['notifications'] is True
+        assert complex_decrypted['iat'] == 1704067200
+
+        # Test unicode token decryption
+        unicode_decrypted = jwt_service.decrypt_jwe_token(unicode_token)
+        assert unicode_decrypted['user_name'] == 'José María'
+        assert unicode_decrypted['description'] == 'Testing with émojis 🚀'
+        assert unicode_decrypted['chinese'] == '你好世界'
+        assert unicode_decrypted['iat'] == 1704067200
+
+
+class TestEncryptDecryptValue:
+    """Tests for JwtService.encrypt_value / decrypt_value (JWE + Fernet fallback)."""
+
+    @pytest.fixture
+    def sample_keys(self):
+        return [
+            EncryptionKey(
+                id='key1',
+                key=SecretStr('test_secret_key_1'),
+                active=True,
+                created_at=datetime(2023, 1, 1, tzinfo=None),
+            ),
+            EncryptionKey(
+                id='key2',
+                key=SecretStr('test_secret_key_2'),
+                active=True,
+                created_at=datetime(2023, 1, 2, tzinfo=None),
+            ),
+        ]
+
+    @pytest.fixture
+    def jwt_service(self, sample_keys):
+        return JwtService(sample_keys)
+
+    def test_encrypt_decrypt_round_trip(self, jwt_service):
+        """encrypt_value then decrypt_value returns the original text."""
+        plaintext = 'super-secret-api-key-12345'
+        ciphertext = jwt_service.encrypt_value(plaintext)
+        assert jwt_service.decrypt_value(ciphertext) == plaintext
+
+    def test_encrypt_decrypt_unicode(self, jwt_service):
+        plaintext = 'Héllo Wörld 🔑'
+        ciphertext = jwt_service.encrypt_value(plaintext)
+        assert jwt_service.decrypt_value(ciphertext) == plaintext
+
+    def test_decrypt_legacy_fernet_value(self, jwt_service, sample_keys):
+        """decrypt_value handles data encrypted with the legacy Fernet scheme."""
+        secret = sample_keys[1].key.get_secret_value()  # key2 (default)
+        fernet_key = b64encode(hashlib.sha256(secret.encode()).digest())
+        f = Fernet(fernet_key)
+        plaintext = 'legacy-encrypted-token'
+        # Fernet.encrypt() returns base64-encoded bytes, decode to string
+        # (no extra b64encode - that was the bug!)
+        legacy_ciphertext = f.encrypt(plaintext.encode()).decode()
+
+        assert jwt_service.decrypt_value(legacy_ciphertext) == plaintext
+
+    def test_decrypt_legacy_fernet_non_default_key(self, jwt_service, sample_keys):
+        """decrypt_value falls through to a non-default key for Fernet."""
+        secret = sample_keys[0].key.get_secret_value()  # key1 (not default)
+        fernet_key = b64encode(hashlib.sha256(secret.encode()).digest())
+        f = Fernet(fernet_key)
+        plaintext = 'old-key-data'
+        # Fernet.encrypt() returns base64-encoded bytes, decode to string
+        # (no extra b64encode - that was the bug!)
+        legacy_ciphertext = f.encrypt(plaintext.encode()).decode()
+
+        assert jwt_service.decrypt_value(legacy_ciphertext) == plaintext
+
+    def test_decrypt_value_fails_for_garbage(self, jwt_service):
+        with pytest.raises(ValueError, match='Failed to decrypt value'):
+            jwt_service.decrypt_value('not-valid-ciphertext-at-all')
+
+    def test_encrypt_value_is_jwe(self, jwt_service):
+        """encrypt_value produces a JWE token (5-part compact serialization)."""
+        ciphertext = jwt_service.encrypt_value('hello')
+        # JWE compact serialization has exactly 4 dots
+        assert ciphertext.count('.') == 4

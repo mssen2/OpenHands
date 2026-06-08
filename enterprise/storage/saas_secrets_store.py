@@ -1,37 +1,45 @@
 from __future__ import annotations
 
-import hashlib
-from base64 import b64decode, b64encode
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from uuid import UUID
 
-from cryptography.fernet import Fernet
-from sqlalchemy.orm import sessionmaker
-from storage.database import session_maker
+from sqlalchemy import delete, select
+from storage.database import a_session_maker
 from storage.stored_custom_secrets import StoredCustomSecrets
+from storage.user_store import UserStore
 
-from openhands.core.config.openhands_config import OpenHandsConfig
-from openhands.core.logger import openhands_logger as logger
-from openhands.storage.data_models.secrets import Secrets
-from openhands.storage.secrets.secrets_store import SecretsStore
+from openhands.app_server.secrets.secrets_models import Secrets
+from openhands.app_server.secrets.secrets_store import SecretsStore
+from openhands.app_server.services.jwt_service import JwtService
+from openhands.app_server.utils.logger import openhands_logger as logger
 
 
 @dataclass
 class SaasSecretsStore(SecretsStore):
     user_id: str
-    session_maker: sessionmaker
-    config: OpenHandsConfig
+    _jwt_svc: JwtService = field(repr=False)
+    # When set, overrides the user's `current_org_id` for both load and
+    # store. Used to honor a request's effective org (api_key_org_id >
+    # X-Org-Id header > user.current_org_id). Secrets are stored per
+    # (user_id, org_id), so the effective org must flow through here for
+    # the right rows to be read/written.
+    effective_org_id: UUID | None = None
 
     async def load(self) -> Secrets | None:
         if not self.user_id:
             return None
+        user = await UserStore.get_user_by_id(self.user_id)
+        org_id = self.effective_org_id or (user.current_org_id if user else None)
 
-        with self.session_maker() as session:
+        async with a_session_maker() as session:
             # Fetch all secrets for the given user ID
-            settings = (
-                session.query(StoredCustomSecrets)
-                .filter(StoredCustomSecrets.keycloak_user_id == self.user_id)
-                .all()
+            query = select(StoredCustomSecrets).filter(
+                StoredCustomSecrets.keycloak_user_id == self.user_id
             )
+            if org_id is not None:
+                query = query.filter(StoredCustomSecrets.org_id == org_id)
+            result = await session.execute(query)
+            settings = result.scalars().all()
 
             if not settings:
                 return Secrets()
@@ -48,12 +56,21 @@ class SaasSecretsStore(SecretsStore):
             return Secrets(custom_secrets=kwargs)  # type: ignore[arg-type]
 
     async def store(self, item: Secrets):
-        with self.session_maker() as session:
+        user = await UserStore.get_user_by_id(self.user_id)
+        if user is None:
+            raise ValueError(f'User not found: {self.user_id}')
+        org_id = self.effective_org_id or user.current_org_id
+
+        async with a_session_maker() as session:
             # Incoming secrets are always the most updated ones
-            # Delete all existing records and override with incoming ones
-            session.query(StoredCustomSecrets).filter(
-                StoredCustomSecrets.keycloak_user_id == self.user_id
-            ).delete()
+            # Delete existing records for this user AND organization only
+            # org_id is always set: it's either the effective org from
+            # the request or the user's non-nullable current_org_id.
+            delete_query = delete(StoredCustomSecrets).filter(
+                StoredCustomSecrets.keycloak_user_id == self.user_id,
+                StoredCustomSecrets.org_id == org_id,
+            )
+            await session.execute(delete_query)
 
             # Prepare the new secrets data
             kwargs = item.model_dump(context={'expose_secrets': True})
@@ -76,16 +93,16 @@ class SaasSecretsStore(SecretsStore):
             for secret_name, secret_value, description in secret_tuples:
                 new_secret = StoredCustomSecrets(
                     keycloak_user_id=self.user_id,
+                    org_id=org_id,
                     secret_name=secret_name,
                     secret_value=secret_value,
                     description=description,
                 )
                 session.add(new_secret)
 
-            session.commit()
+            await session.commit()
 
     def _decrypt_kwargs(self, kwargs: dict):
-        fernet = self._fernet()
         for key, value in kwargs.items():
             if isinstance(value, dict):
                 self._decrypt_kwargs(value)
@@ -94,11 +111,9 @@ class SaasSecretsStore(SecretsStore):
             if value is None:
                 kwargs[key] = value
             else:
-                value = fernet.decrypt(b64decode(value.encode())).decode()
-                kwargs[key] = value
+                kwargs[key] = self._jwt_svc.decrypt_value(value)
 
     def _encrypt_kwargs(self, kwargs: dict):
-        fernet = self._fernet()
         for key, value in kwargs.items():
             if isinstance(value, dict):
                 self._encrypt_kwargs(value)
@@ -107,23 +122,31 @@ class SaasSecretsStore(SecretsStore):
             if value is None:
                 kwargs[key] = value
             else:
-                encrypted_value = b64encode(fernet.encrypt(value.encode())).decode()
-                kwargs[key] = encrypted_value
-
-    def _fernet(self):
-        if not self.config.jwt_secret:
-            raise Exception('config.jwt_secret must be set')
-        jwt_secret = self.config.jwt_secret.get_secret_value()
-        fernet_key = b64encode(hashlib.sha256(jwt_secret.encode()).digest())
-        return Fernet(fernet_key)
+                kwargs[key] = self._jwt_svc.encrypt_value(value)
 
     @classmethod
-    async def get_instance(
+    async def get_instance(  # type: ignore[override]
         cls,
-        config: OpenHandsConfig,
-        user_id: str | None,
+        user_id: str,
+        effective_org_id: UUID | None = None,
     ) -> SaasSecretsStore:
-        if not user_id:
-            raise Exception('SaasSecretsStore cannot be constructed with no user_id')
+        """Get a SaasSecretsStore instance for the given user.
+
+        Args:
+            user_id: Keycloak user id.
+            effective_org_id: Optional org id resolved from the request
+                (see SaasUserAuth.get_effective_org_id). When None the
+                store falls back to ``user.current_org_id`` to preserve
+                legacy behavior for background / non-request callers
+                (e.g. webhook resolvers).
+
+        TODO: This method should be replaced with dependency injection.
+        """
         logger.debug(f'saas_secrets_store.get_instance::{user_id}')
-        return SaasSecretsStore(user_id, session_maker, config)
+        from storage.encrypt_utils import get_jwt_service
+
+        return SaasSecretsStore(
+            user_id,
+            get_jwt_service(),
+            effective_org_id=effective_org_id,
+        )

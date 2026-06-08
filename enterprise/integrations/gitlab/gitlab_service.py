@@ -1,21 +1,21 @@
 import asyncio
 
+from integrations.store_repo_utils import store_repositories_in_db
 from integrations.types import GitLabResourceType
-from integrations.utils import store_repositories_in_db
 from pydantic import SecretStr
 from server.auth.token_manager import TokenManager
 from storage.gitlab_webhook import GitlabWebhook, WebhookStatus
 from storage.gitlab_webhook_store import GitlabWebhookStore
 
-from openhands.core.logger import openhands_logger as logger
-from openhands.integrations.gitlab.gitlab_service import GitLabService
-from openhands.integrations.service_types import (
+from openhands.app_server.integrations.gitlab.gitlab_service import GitLabService
+from openhands.app_server.integrations.service_types import (
     ProviderType,
     RateLimitError,
     Repository,
     RequestMethod,
 )
-from openhands.server.types import AppMode
+from openhands.app_server.types import AppMode
+from openhands.app_server.utils.logger import openhands_logger as logger
 
 
 class SaaSGitLabService(GitLabService):
@@ -59,20 +59,22 @@ class SaaSGitLabService(GitLabService):
             offline_token = await self.token_manager.load_offline_token(
                 self.external_auth_id
             )
-            gitlab_token = SecretStr(
+            gitlab_token_str: str | None = (
                 await self.token_manager.get_idp_token_from_offline_token(
                     offline_token, ProviderType.GITLAB
                 )
+                if offline_token
+                else None
             )
+            gitlab_token = SecretStr(gitlab_token_str) if gitlab_token_str else None
             logger.info(
-                f'Got GitLab token {gitlab_token.get_secret_value()} from external auth user ID: {self.external_auth_id}'
+                f'Got GitLab token {gitlab_token} from external auth user ID: {self.external_auth_id}'
             )
         elif self.user_id:
-            gitlab_token = SecretStr(
-                await self.token_manager.get_idp_token_from_idp_user_id(
-                    self.user_id, ProviderType.GITLAB
-                )
+            gitlab_token_str = await self.token_manager.get_idp_token_from_idp_user_id(
+                self.user_id, ProviderType.GITLAB
             )
+            gitlab_token = SecretStr(gitlab_token_str) if gitlab_token_str else None
             logger.debug(
                 f'Got Gitlab token {gitlab_token} from user ID: {self.user_id}'
             )
@@ -80,22 +82,52 @@ class SaaSGitLabService(GitLabService):
             logger.warning('external_auth_token and user_id not set!')
         return gitlab_token
 
-    async def get_owned_groups(self) -> list[dict]:
+    async def get_owned_groups(self, min_access_level: int = 40) -> list[dict]:
         """
-        Get all groups for which the current user is the owner.
+        Get all top-level groups where the current user has admin access.
+
+        This method supports pagination and fetches all groups where the user has
+        at least the specified access level.
+
+        Args:
+            min_access_level: Minimum access level required (default: 40 for Maintainer or Owner)
+                             - 40: Maintainer or Owner
+                             - 50: Owner only
 
         Returns:
-            list[dict]: A list of groups owned by the current user.
+            list[dict]: A list of groups where user has the specified access level or higher.
         """
-        url = f'{self.BASE_URL}/groups'
-        params = {'owned': 'true', 'per_page': 100, 'top_level_only': 'true'}
+        groups_with_admin_access = []
+        page = 1
+        per_page = 100
 
-        try:
-            response, headers = await self._make_request(url, params)
-            return response
-        except Exception:
-            logger.warning('Error fetching owned groups', exc_info=True)
-            return []
+        while True:
+            try:
+                url = f'{self.BASE_URL}/groups'
+                params = {
+                    'page': str(page),
+                    'per_page': str(per_page),
+                    'min_access_level': min_access_level,
+                    'top_level_only': 'true',
+                }
+                response, headers = await self._make_request(url, params)
+
+                if not response:
+                    break
+
+                groups_with_admin_access.extend(response)
+                page += 1
+
+                # Check if we've reached the last page
+                link_header = headers.get('Link', '')
+                if 'rel="next"' not in link_header:
+                    break
+
+            except Exception:
+                logger.warning(f'Error fetching groups on page {page}', exc_info=True)
+                break
+
+        return groups_with_admin_access
 
     async def add_owned_projects_and_groups_to_db(self, owned_personal_projects):
         """
@@ -155,6 +187,30 @@ class SaaSGitLabService(GitLabService):
             users_personal_projects: List of personal projects owned by the user
             repositories: List of Repository objects to store
         """
+        # If external_auth_id is not set, try to determine it from the Keycloak token
+        if not self.external_auth_id and self.external_auth_token:
+            try:
+                user_info = await self.token_manager.get_user_info(
+                    self.external_auth_token.get_secret_value()
+                )
+                keycloak_user_id = user_info.sub
+                self.external_auth_id = keycloak_user_id
+                logger.info(
+                    f'Determined external_auth_id from Keycloak token: {self.external_auth_id}'
+                )
+            except Exception:
+                logger.warning(
+                    'Cannot store repository data: external_auth_id is not set and could not be determined from token',
+                    exc_info=True,
+                )
+                return
+
+        if not self.external_auth_id:
+            logger.warning(
+                'Cannot store repository data: external_auth_id could not be determined'
+            )
+            return
+
         try:
             # First, add owned projects and groups to the database
             await self.add_owned_projects_and_groups_to_db(users_personal_projects)
@@ -527,3 +583,55 @@ class SaaSGitLabService(GitLabService):
             await self._make_request(url=url, params=params, method=RequestMethod.POST)
         except Exception as e:
             logger.exception(f'[GitLab]: Reply to MR failed {e}')
+
+    async def get_user_resources_with_admin_access(
+        self,
+    ) -> tuple[list[dict], list[dict]]:
+        """
+        Get all projects and groups where the current user has admin access (maintainer or owner).
+
+        Returns:
+            tuple[list[dict], list[dict]]: A tuple containing:
+                - list of projects where user has admin access
+                - list of groups where user has admin access
+        """
+        projects_with_admin_access = []
+        groups_with_admin_access = []
+
+        # Fetch all projects the user is a member of
+        page = 1
+        per_page = 100
+        while True:
+            try:
+                url = f'{self.BASE_URL}/projects'
+                params = {
+                    'page': str(page),
+                    'per_page': str(per_page),
+                    'membership': 1,
+                    'min_access_level': 40,  # Maintainer or Owner
+                }
+                response, headers = await self._make_request(url, params)
+
+                if not response:
+                    break
+
+                projects_with_admin_access.extend(response)
+                page += 1
+
+                # Check if we've reached the last page
+                link_header = headers.get('Link', '')
+                if 'rel="next"' not in link_header:
+                    break
+
+            except Exception:
+                logger.warning(f'Error fetching projects on page {page}', exc_info=True)
+                break
+
+        # Fetch all groups where user is owner or maintainer
+        groups_with_admin_access = await self.get_owned_groups(min_access_level=40)
+
+        logger.info(
+            f'Found {len(projects_with_admin_access)} projects and {len(groups_with_admin_access)} groups with admin access'
+        )
+
+        return projects_with_admin_access, groups_with_admin_access
